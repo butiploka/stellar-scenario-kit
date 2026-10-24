@@ -188,18 +188,33 @@ pub fn diagnose() -> Vec<Diagnostic> {
 mod tests {
     use super::*;
 
+    /// The Stellar CLI is not installed on every CI runner. Tests that need
+    /// it must skip cleanly rather than fail, so `cargo test --workspace`
+    /// stays green in a bare environment.
+    fn cli_or_skip() -> Option<StellarCli> {
+        match StellarCli::discover() {
+            Ok(cli) => Some(cli),
+            Err(_) => {
+                eprintln!("skipping: stellar CLI not available on this host");
+                None
+            }
+        }
+    }
+
     #[test]
     fn discover_finds_installed_cli() {
-        // The VPS has the Stellar CLI installed; this asserts the discovery
-        // path works end to end without touching the network.
-        let cli = StellarCli::discover().expect("stellar CLI should be installed");
+        let Some(cli) = cli_or_skip() else {
+            return;
+        };
         assert!(cli.executable.exists());
         assert!(cli.version.contains("stellar"));
     }
 
     #[test]
     fn list_networks_returns_known_profiles() {
-        let cli = StellarCli::discover().unwrap();
+        let Some(cli) = cli_or_skip() else {
+            return;
+        };
         let networks = cli.list_networks().unwrap();
         assert!(
             networks.contains(&"testnet".to_string()),
@@ -209,7 +224,9 @@ mod tests {
 
     #[test]
     fn list_identities_returns_names_only() {
-        let cli = StellarCli::discover().unwrap();
+        let Some(cli) = cli_or_skip() else {
+            return;
+        };
         let names = cli.list_identities().unwrap();
         // Names must never look like secret keys.
         for n in &names {
