@@ -30,6 +30,9 @@ pub struct Scenario {
     /// Default identity used by steps that do not specify one.
     #[serde(default)]
     pub source: Option<String>,
+    /// Subprocess timeout in seconds for this scenario. Defaults to 120.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
     /// Ordered list of steps to run.
     pub steps: Vec<Step>,
 }
@@ -48,6 +51,18 @@ pub struct Step {
 }
 
 impl Scenario {
+    /// Subprocess timeout for this scenario.
+    ///
+    /// Returns `timeout_seconds` when set, otherwise
+    /// [`crate::runner::DEFAULT_TIMEOUT`]. Validation guarantees a set value
+    /// is within `MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS`.
+    pub fn timeout_duration(&self) -> std::time::Duration {
+        match self.timeout_seconds {
+            Some(secs) => std::time::Duration::from_secs(secs),
+            None => crate::runner::DEFAULT_TIMEOUT,
+        }
+    }
+
     /// Parse and validate a scenario from a file path.
     pub fn from_file(path: &Path) -> Result<Self, ScenarioError> {
         let raw = std::fs::read_to_string(path).map_err(|e| ScenarioError::Io {
@@ -112,6 +127,28 @@ impl Scenario {
                 message: "steps must contain at least one step".into(),
                 line: None,
             });
+        }
+
+        if let Some(secs) = self.timeout_seconds {
+            if secs < crate::runner::MIN_TIMEOUT_SECS {
+                issues.push(ValidationIssue {
+                    field: "timeout_seconds".into(),
+                    message: format!(
+                        "timeout_seconds must be at least {} second(s), got {secs}",
+                        crate::runner::MIN_TIMEOUT_SECS
+                    ),
+                    line: None,
+                });
+            } else if secs > crate::runner::MAX_TIMEOUT_SECS {
+                issues.push(ValidationIssue {
+                    field: "timeout_seconds".into(),
+                    message: format!(
+                        "timeout_seconds must be at most {} second(s), got {secs}",
+                        crate::runner::MAX_TIMEOUT_SECS
+                    ),
+                    line: None,
+                });
+            }
         }
 
         for (idx, step) in self.steps.iter().enumerate() {

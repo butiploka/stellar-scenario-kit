@@ -251,6 +251,7 @@ name: payment_alice_to_bob     # required; non-empty
 description: Send 100 XLM      # optional
 network: testnet               # required; network profile name
 source: alice                  # optional; default identity
+timeout_seconds: 120           # optional; 1..=3600, defaults to 120
 steps:                         # required; at least one step
   - action: ensure_funded
     identity: alice
@@ -271,6 +272,26 @@ steps:                         # required; at least one step
     identity: carol
     asset: native              # existence-only; no min_balance
 ```
+
+### Timeout
+
+`timeout_seconds` is a top-level field that applies to every subprocess the
+scenario spawns. It is deliberately scenario-level rather than per-step: the
+only executable action today is a single RPC read, and a per-step timeout
+would add schema surface with no concrete use case.
+
+- Default when omitted: 120 seconds.
+- Allowed range: `1` to `3600` inclusive. Values outside the range are
+  rejected at validation time with an actionable error.
+- The bounds are policy, not technical limits. The floor of 1 second exists
+  because a shorter timeout cannot let a real RPC read complete. The ceiling
+  of 3600 seconds exists because a longer value is more likely a hung process
+  than a slow query, and would pin a CI job for that long.
+- The timeout is enforced by the runner's poll-and-kill loop. On expiry the
+  child is killed and reaped before the error returns, so no orphan process
+  is left behind.
+- Omitting the field preserves the previous 120-second behavior exactly. No
+  existing scenario changes behavior.
 
 ### Actions
 
@@ -302,7 +323,30 @@ steps:                         # required; at least one step
 - `identity` — the account to query.
 - `asset` — the token to query. Defaults to `native`.
 - A `pass` result proves that the RPC returned a balance entry for the named
-  account and asset. It does not prove the balance is above any threshold.
+  account and asset. **It does not prove the balance is non-zero.** The RPC
+  returns a balance entry with value `0` for a trustline that exists but
+  holds no funds, and that is a pass. Use `assert_balance` with an explicit
+  `min_balance` when the value matters.
+- A `fail` result is not possible for this mode: the query either returns an
+  entry (pass) or errors.
+
+### Balance value handling
+
+The parser reads the raw smallest-unit integer string the CLI reports and
+rejects anything that is not a non-negative decimal integer. A value
+containing a decimal point, sign, exponent, separator, or non-ASCII digit is
+an error result, never a coerced zero — a parser failure must not become a
+passing assertion.
+
+| Response shape | Outcome |
+|----------------|---------|
+| `{"balance":"12345"}` | Parsed as the raw balance |
+| `{"error":{"type":"...","message":"..."}}` | Error result carrying the CLI's type and message |
+| Malformed JSON | Error result naming the parse failure |
+| `{"decimals":7}` (no `balance`) | Error result: missing `balance` field |
+| `{"balance":""}` | Error result: balance is empty |
+| `{"balance":"12.5"}` | Error result: not a non-negative decimal integer |
+| `{"balance":"-1"}` | Error result: not a non-negative decimal integer |
 
 ### Network and account prerequisites
 
@@ -456,15 +500,46 @@ green on a bare host.
 
 ## Known limitations
 
-- Live output compatibility for non-native assets is unverified. The parser
-  was built against the observed `{"balance":"<stroops>"}` shape for native
-  XLM; `CODE:ISSUER` and contract-id assets have not been exercised against
-  a live network.
+- **Non-native asset support is not live-verified.** No existing
+  non-native asset/account pair was available on this host's testnet
+  identities, so no successful non-native balance read has been observed.
+  The parser accepts the documented `CODE:ISSUER` form and the same
+  `{"balance":"<smallest-unit>"}` response shape, but that shape has only
+  been confirmed for `native`. See [Non-native asset status](#non-native-asset-status).
 - The `--decimal` output mode is not parsed. Only the raw smallest-unit
   integer form is used, because it avoids floating-point rounding entirely.
-- Timeout is a fixed 120 seconds. It is not configurable per scenario.
+- Timeout is scenario-level, not per-step.
 - `assert_asset` proves only that a balance entry exists; it does not prove
   the balance is non-zero.
+
+### Non-native asset status
+
+Live investigation performed on this host (read-only, no state changed):
+
+- Command syntax confirmed from `stellar token balance --help`: `--id`
+  accepts a contract id or alias, `native`, or a classic asset as
+  `CODE:ISSUER`.
+- Queried `USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`
+  against all four local testnet identities (`deployer`, `preview`,
+  `throwaway-a`, `throwaway-b`).
+- Every query returned an error, not a balance:
+
+  ```
+  {"error":{"type":"invoke","message":"transaction simulation failed: HostError: Error(Contract, #13) ... \"trustline entry is missing for account\""}}
+  ```
+
+  The `#13` host error means the account has no trustline for that asset.
+  None of the local identities hold a USDC trustline on testnet, so no
+  successful non-native read was possible without creating one — which this
+  milestone does not permit.
+- The error shape is therefore live-verified for the non-native path; the
+  success shape is not.
+- The asset identifier is passed through as the literal `CODE:ISSUER`
+  string; the CLI resolves it to a Stellar Asset Contract id internally.
+- The raw balance is expected to be in that token's smallest unit, which is
+  **not** necessarily stroops. A token with `decimals: 6` reports millionths,
+  not ten-millionths. The parser does not assume any particular `decimals`
+  value and never converts.
 
 ## Minimum Supported Rust Version
 

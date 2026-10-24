@@ -18,6 +18,19 @@ use thiserror::Error;
 /// Default subprocess timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Minimum accepted scenario timeout, in seconds.
+///
+/// A zero or near-zero timeout cannot let a real RPC read complete, so the
+/// floor is one second. This is a policy floor, not a technical limit.
+pub const MIN_TIMEOUT_SECS: u64 = 1;
+
+/// Maximum accepted scenario timeout, in seconds (one hour).
+///
+/// This is a policy ceiling: a longer value is more likely to mean a hung
+/// process than a genuinely slow query, and would pin a CI job for that long.
+/// It is not a technical constraint of the runner.
+pub const MAX_TIMEOUT_SECS: u64 = 3600;
+
 /// Environment variable that overrides the Stellar CLI executable.
 pub const CLI_ENV_VAR: &str = "STELLAR_CLI";
 
@@ -366,5 +379,63 @@ mod tests {
     fn find_cli_prefers_explicit_path() {
         let found = find_stellar_cli(Some("/custom/stellar")).unwrap();
         assert_eq!(found, PathBuf::from("/custom/stellar"));
+    }
+
+    #[test]
+    fn timeout_bounds_are_sane() {
+        // Compile-time checks on the constants.
+        const { assert!(MIN_TIMEOUT_SECS >= 1) };
+        const { assert!(MAX_TIMEOUT_SECS > MIN_TIMEOUT_SECS) };
+        const { assert!(DEFAULT_TIMEOUT.as_secs() >= MIN_TIMEOUT_SECS) };
+        const { assert!(DEFAULT_TIMEOUT.as_secs() <= MAX_TIMEOUT_SECS) };
+    }
+
+    #[test]
+    fn timeout_leaves_no_orphan_process() {
+        // Spawn a process that writes its pid, then let it outlive the
+        // timeout. After the runner returns, that pid must be gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > {}; sleep 30", pid_file.display());
+        let _ = run(
+            OsStr::new("bash"),
+            &[OsStr::new("-c"), OsStr::new(&script)],
+            Duration::from_millis(300),
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file written")
+            .trim()
+            .parse()
+            .expect("pid parses");
+
+        // /proc/<pid> disappears once the process is reaped.
+        let proc_path = format!("/proc/{pid}");
+        let mut still_running = true;
+        for _ in 0..50 {
+            if !std::path::Path::new(&proc_path).exists() {
+                still_running = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_running,
+            "child pid {pid} still running after timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_error_reports_configured_seconds() {
+        let err = run(
+            OsStr::new("sleep"),
+            &[OsStr::new("30")],
+            Duration::from_secs(7),
+        )
+        .unwrap_err();
+        match err {
+            RunnerError::Timeout { secs } => assert_eq!(secs, 7),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 }

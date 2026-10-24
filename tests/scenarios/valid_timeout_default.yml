@@ -1,0 +1,6 @@
+schema_version: "1.0"
+name: timeout_default
+network: testnet
+steps:
+  - action: assert_asset
+    identity: alice

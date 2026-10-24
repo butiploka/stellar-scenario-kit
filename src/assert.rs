@@ -216,21 +216,27 @@ impl AssertBalanceResult {
         ];
 
         let run_result =
-            runner::run_capture(executable.as_os_str(), &args, runner::DEFAULT_TIMEOUT);
+            runner::run_capture(executable.as_os_str(), &args, scenario.timeout_duration());
 
         match run_result {
             Ok(output) => match parse_balance_json(&output.stdout) {
-                Ok(actual) => match ctx.mode {
-                    AssertionMode::MinBalance => {
-                        let expected = ctx.expected_min_balance.clone().unwrap_or_default();
-                        match compare_balances(&actual, &expected) {
-                            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
-                                ctx.pass(&actual, &expected)
+                Ok(actual) => match validate_balance_string(&actual) {
+                    Err(e) => ctx.error(&format!("invalid balance value: {e}")),
+                    Ok(()) => match ctx.mode {
+                        AssertionMode::MinBalance => {
+                            let expected = ctx.expected_min_balance.clone().unwrap_or_default();
+                            match validate_balance_string(&expected) {
+                                Err(e) => ctx.error(&format!("invalid expected value: {e}")),
+                                Ok(()) => match compare_balances(&actual, &expected) {
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
+                                        ctx.pass(&actual, &expected)
+                                    }
+                                    std::cmp::Ordering::Less => ctx.fail(&actual, &expected),
+                                },
                             }
-                            std::cmp::Ordering::Less => ctx.fail(&actual, &expected),
                         }
-                    }
-                    AssertionMode::Exists => ctx.exists_pass(&actual),
+                        AssertionMode::Exists => ctx.exists_pass(&actual),
+                    },
                 },
                 Err(e) => ctx.error(&format!("failed to parse balance JSON: {e}")),
             },
@@ -242,13 +248,13 @@ impl AssertBalanceResult {
 /// Parse `{"balance":"<value>"}` or `{"error":{...}}` from stdout.
 ///
 /// Returns:
-/// - `Ok(Some(balance_str))` on success
+/// - `Ok(balance)` on success
 /// - `Err(...)` when the JSON carries an error object, is malformed, or is
 ///   missing the `balance` field
 ///
-/// There is deliberately no `Ok(None)` case: a balance query either returns a
-/// balance or fails. Collapsing "no balance" into a success path would let a
-/// missing account read as a zero balance.
+/// There is deliberately no success path that yields "no balance": a balance
+/// query either returns a balance or fails. Collapsing "no balance" into a
+/// success would let a missing account read as a zero balance.
 fn parse_balance_json(stdout: &str) -> Result<String, String> {
     let v: serde_json::Value = serde_json::from_str(stdout).map_err(|e| e.to_string())?;
     if let Some(error) = v.get("error") {
@@ -272,10 +278,36 @@ fn parse_balance_json(stdout: &str) -> Result<String, String> {
     Ok(balance.to_string())
 }
 
+/// Validate that a balance string is a non-negative decimal integer.
+///
+/// The Stellar CLI reports raw balances as decimal integer strings in the
+/// asset's smallest unit. Anything else — a decimal point, a sign, a
+/// scientific-notation exponent, non-ASCII digits — is rejected rather than
+/// coerced, because silently reading a malformed value as zero would turn a
+/// parser failure into a passing assertion.
+fn validate_balance_string(balance: &str) -> Result<(), String> {
+    if balance.is_empty() {
+        return Err("balance is empty".to_string());
+    }
+    if !balance.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "balance '{balance}' is not a non-negative decimal integer"
+        ));
+    }
+    if u128::from_str(balance).is_err() {
+        return Err(format!("balance '{balance}' exceeds the u128 range"));
+    }
+    Ok(())
+}
+
 /// Compare two balance strings as unsigned integers.
 ///
 /// Both values must be decimal integers. No floating-point arithmetic is
 /// used. Returns `Ordering` of `actual` vs `expected`.
+///
+/// Callers should validate both strings with [`validate_balance_string`]
+/// first; this function falls back to `0` for unparseable input so it never
+/// panics, but a fallback zero is not a meaningful comparison.
 fn compare_balances(actual: &str, expected: &str) -> std::cmp::Ordering {
     let a = u128::from_str(actual).unwrap_or(0);
     let e = u128::from_str(expected).unwrap_or(0);
@@ -529,6 +561,120 @@ mod tests {
         use std::cmp::Ordering;
         assert_eq!(compare_balances("nope", "0"), Ordering::Equal);
         assert_eq!(compare_balances("", "1"), Ordering::Less);
+    }
+
+    #[test]
+    fn validate_balance_string_accepts_integers() {
+        assert!(validate_balance_string("0").is_ok());
+        assert!(validate_balance_string("99282512062").is_ok());
+        assert!(validate_balance_string(&u128::MAX.to_string()).is_ok());
+    }
+
+    #[test]
+    fn validate_balance_string_rejects_non_integers() {
+        for bad in [
+            "", "12.5", "-1", "+1", "1e10", " 1", "1 ", "0x10", "١٢٣", "1_000", "1,000",
+        ] {
+            assert!(
+                validate_balance_string(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_balance_string_rejects_above_u128() {
+        let too_big = format!("1{}", "0".repeat(40));
+        assert!(validate_balance_string(&too_big).is_err());
+    }
+
+    #[test]
+    fn timeout_duration_defaults_to_120() {
+        let s = Scenario::from_str(
+            r#"schema_version: "1.0"
+name: t
+network: testnet
+steps:
+  - action: assert_asset
+    identity: a
+"#,
+        )
+        .unwrap();
+        assert_eq!(s.timeout_duration(), std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn timeout_duration_uses_scenario_value() {
+        let s = Scenario::from_str(
+            r#"schema_version: "1.0"
+name: t
+network: testnet
+timeout_seconds: 45
+steps:
+  - action: assert_asset
+    identity: a
+"#,
+        )
+        .unwrap();
+        assert_eq!(s.timeout_duration(), std::time::Duration::from_secs(45));
+    }
+
+    #[test]
+    fn timeout_zero_is_rejected() {
+        let err = scenario_with_err(
+            r#"schema_version: "1.0"
+name: t
+network: testnet
+timeout_seconds: 0
+steps:
+  - action: assert_asset
+    identity: a
+"#,
+        );
+        assert!(err.iter().any(|i| i.field == "timeout_seconds"));
+    }
+
+    #[test]
+    fn timeout_above_max_is_rejected() {
+        let err = scenario_with_err(
+            r#"schema_version: "1.0"
+name: t
+network: testnet
+timeout_seconds: 3601
+steps:
+  - action: assert_asset
+    identity: a
+"#,
+        );
+        assert!(err.iter().any(|i| i.field == "timeout_seconds"));
+    }
+
+    #[test]
+    fn timeout_boundaries_are_accepted() {
+        for secs in [1u64, 3600] {
+            let raw = format!(
+                r#"schema_version: "1.0"
+name: t
+network: testnet
+timeout_seconds: {secs}
+steps:
+  - action: assert_asset
+    identity: a
+"#
+            );
+            assert!(
+                Scenario::from_str(&raw).is_ok(),
+                "timeout {secs} should be valid"
+            );
+        }
+    }
+
+    fn scenario_with_err(raw: &str) -> Vec<crate::error::ValidationIssue> {
+        match Scenario::from_str(raw) {
+            Ok(_) => panic!("expected validation failure"),
+            Err(crate::error::ScenarioError::Invalid { issues }) => issues,
+            Err(other) => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

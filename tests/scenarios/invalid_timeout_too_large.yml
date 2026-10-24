@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: timeout_too_large
+network: testnet
+timeout_seconds: 99999
+steps:
+  - action: assert_asset
+    identity: alice

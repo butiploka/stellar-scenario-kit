@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: timeout_max
+network: testnet
+timeout_seconds: 3600
+steps:
+  - action: assert_asset
+    identity: alice

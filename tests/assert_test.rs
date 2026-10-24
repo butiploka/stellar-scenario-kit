@@ -45,6 +45,34 @@ fn assert_rejects_invalid_scenario() {
 }
 
 #[test]
+fn assert_rejects_zero_timeout() {
+    assert_cmd(&fixture("invalid_timeout_zero.yml"))
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("timeout_seconds"));
+}
+
+#[test]
+fn assert_rejects_excessive_timeout() {
+    assert_cmd(&fixture("invalid_timeout_too_large.yml"))
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("timeout_seconds"));
+}
+
+#[test]
+fn assert_accepts_boundary_timeouts() {
+    for name in ["valid_timeout_min.yml", "valid_timeout_max.yml"] {
+        assert_cmd(&fixture(name))
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("timeout_seconds").not());
+    }
+}
+
+#[test]
 fn assert_emits_structured_report() {
     if !stellar_available() {
         eprintln!("skipping: stellar CLI not available on this host");
