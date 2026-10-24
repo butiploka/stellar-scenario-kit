@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: assert_asset_exists
+description: Existence-only assertion; no minimum balance required.
+network: testnet
+steps:
+  - action: assert_asset
+    identity: deployer
+    asset: native

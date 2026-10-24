@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: assert_asset_bad_asset_type
+description: assert_asset with a non-string asset must be rejected.
+network: testnet
+steps:
+  - action: assert_asset
+    identity: alice
+    asset: 42

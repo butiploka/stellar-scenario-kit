@@ -1,0 +1,11 @@
+schema_version: "1.0"
+name: mutating_only
+description: Only mutating steps; assert must skip every one of them.
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: deployer
+  - action: payment
+    from: deployer
+    to: preview
+    amount: "1"

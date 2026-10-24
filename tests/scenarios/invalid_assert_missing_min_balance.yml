@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: missing_min_balance
+description: assert_balance without min_balance must be rejected.
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice

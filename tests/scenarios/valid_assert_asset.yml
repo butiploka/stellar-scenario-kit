@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: valid_assert_asset
+description: Existence-only assertion fixture.
+network: testnet
+steps:
+  - action: assert_asset
+    identity: preview
+    asset: native

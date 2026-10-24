@@ -168,7 +168,7 @@ fn plan_step(index: usize, step: &Step, scenario: &Scenario, executable: &str) -
                 SideEffect::MutatesRemoteState,
             )
         }
-        "assert_balance" => {
+        "assert_balance" | "assert_asset" => {
             let asset = step
                 .params
                 .get("asset")
@@ -221,6 +221,7 @@ steps:
     amount: "100"
   - action: assert_balance
     identity: bob
+    min_balance: "0"
 "#;
 
     #[test]

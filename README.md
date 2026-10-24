@@ -19,7 +19,8 @@ Implemented:
 - `stellar-scenario validate` — parse and validate a scenario file
 - `stellar-scenario plan` — print the exact Stellar CLI commands a run would
   execute, without executing anything
-- `stellar-scenario assert` — execute read-only `assert_balance` steps
+- `stellar-scenario assert` — execute read-only `assert_balance` and
+  `assert_asset` steps, with a structured aggregate report
 - `stellar-scenario doctor` — report environment readiness
 - Versioned schema (`schema_version: "1.0"`)
 - Semantic validation of steps, actions, and fields
@@ -124,7 +125,7 @@ stellar-scenario plan examples/payment.yml
 the scenario file plus the resolved CLI path, so it is safe to run anywhere,
 including CI.
 
-### Assert a balance
+### Assert balances or asset existence
 
 ```bash
 stellar-scenario assert examples/assert_balance.yml
@@ -133,11 +134,21 @@ stellar-scenario assert examples/assert_balance.yml
 ```json
 {
   "scenario": "assert_native_balance",
+  "schema_version": "1.0",
   "network": "testnet",
+  "total_steps": 1,
+  "passed": 1,
+  "failed": 0,
+  "errors": 0,
+  "skipped_mutating": 0,
+  "skipped_not_executable": 0,
+  "status": "passed",
   "results": [
     {
       "scenario": "assert_native_balance",
       "step_index": 0,
+      "action": "assert_balance",
+      "mode": "min_balance",
       "account": "deployer",
       "network": "testnet",
       "asset": "native",
@@ -147,12 +158,14 @@ stellar-scenario assert examples/assert_balance.yml
       "diagnostic": "balance 99282512062 >= expected 1"
     }
   ],
-  "skipped_steps": []
+  "skipped": []
 }
 ```
 
 `assert` executes only read-only steps. Any step that would mutate remote
-state (funding, payments) is reported under `skipped_steps` and never run.
+state (funding, payments) is reported under `skipped` with reason
+`would_mutate` and never run. Read-only steps that have no executor yet are
+reported with reason `not_executable`.
 
 Human-readable output on stderr:
 
@@ -161,7 +174,8 @@ stellar-scenario assert examples/assert_balance.yml --output text
 ```
 
 ```
-PASS	[0]	deployer on testnet	balance 99282512062 >= expected 1
+assert_native_balance on testnet: passed (1 step(s), 1 passed, 0 failed, 0 error(s), 0 skipped)
+  PASS	[0]	deployer on testnet	balance 99282512062 >= expected 1
 ```
 
 ### Check the environment
@@ -251,7 +265,11 @@ steps:                         # required; at least one step
   - action: assert_balance
     identity: bob
     asset: native              # optional; defaults to native
-    min_balance: 100           # optional; integer or string of digits
+    min_balance: 100           # required; integer or string of digits
+
+  - action: assert_asset
+    identity: carol
+    asset: native              # existence-only; no min_balance
 ```
 
 ### Actions
@@ -260,7 +278,8 @@ steps:                         # required; at least one step
 |--------|-----------------|-----------------|----------------------|
 | `ensure_funded` | `identity` | `min_balance` | Mutates remote state |
 | `payment` | `from`, `to`, `amount` | `asset` | Mutates remote state |
-| `assert_balance` | `identity` | `asset`, `min_balance` | Read only |
+| `assert_balance` | `identity`, `min_balance` | `asset` | Read only |
+| `assert_asset` | `identity` | `asset` | Read only |
 
 ### `assert_balance` semantics
 
@@ -269,10 +288,21 @@ steps:                         # required; at least one step
 - `asset` — the token to query. Accepts `native`, a classic asset as
   `CODE:ISSUER`, or a contract id or alias. Defaults to `native`.
 - `min_balance` — the minimum acceptable balance, in the asset's smallest
-  unit (stroops for native XLM). Defaults to `0`. Accepts a YAML integer or
-  a quoted string of digits; the string form is preferred for large values.
+  unit (stroops for native XLM). **Required.** Accepts a YAML integer or a
+  quoted string of digits; the string form is preferred for large values.
 - Comparison is `actual >= min_balance`, using unsigned 128-bit integer
   arithmetic. No floating-point arithmetic is used anywhere in the comparison.
+- A `pass` result proves that, at the moment the RPC read returned, the named
+  account held at least `min_balance` of the named asset on the named
+  network. It does not prove the balance is still that value later, and it
+  is not a transaction confirmation.
+
+### `assert_asset` semantics
+
+- `identity` — the account to query.
+- `asset` — the token to query. Defaults to `native`.
+- A `pass` result proves that the RPC returned a balance entry for the named
+  account and asset. It does not prove the balance is above any threshold.
 
 ### Network and account prerequisites
 
@@ -281,6 +311,17 @@ steps:                         # required; at least one step
 - The account must exist on that network. A missing account produces an
   error result, not a zero balance.
 - The Stellar CLI must be reachable and the RPC endpoint must respond.
+
+### Versioning and backwards compatibility
+
+`schema_version: "1.0"` is the current and only version. `min_balance` was
+previously optional for `assert_balance` (defaulting to `0`); it is now
+required. Existing scenarios that omit `min_balance` will fail validation
+with a clear message suggesting `assert_asset` for existence-only checks.
+
+No other fields were made required, and no fields were removed. Scenarios
+that already specify `min_balance` continue to validate and behave exactly
+as before.
 
 ### JSON output fields
 
@@ -310,33 +351,52 @@ Execution plan:
 Each entry in `commands` has `step_index`, `action`, `executable`, `args`, and
 `side_effect` (`read_only` or `mutates_remote_state`).
 
-Assertion result:
+Assertion report (`assert` command):
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `scenario` | string | Scenario name |
-| `step_index` | integer | Zero-based step index |
-| `account` | string | Account that was queried |
-| `network` | string | Network profile used |
-| `asset` | string | Asset identifier |
-| `expected_min_balance` | string | Expected minimum, smallest unit |
-| `actual_balance` | string or null | Actual balance; null when the query failed |
-| `status` | string | `"pass"`, `"fail"`, or `"error"` |
-| `diagnostic` | string | Human-readable explanation; never contains secrets |
+| `schema_version` | string | Version declared by the scenario file |
+| `network` | string | Network profile the run targeted |
+| `total_steps` | integer | Total steps declared in the scenario |
+| `passed` | integer | Assertions that passed |
+| `failed` | integer | Assertions that failed |
+| `errors` | integer | Assertions that errored |
+| `skipped_mutating` | integer | Steps skipped because they would mutate remote state |
+| `skipped_not_executable` | integer | Steps skipped because no executor exists yet |
+| `status` | string | `"passed"`, `"failed"`, `"errored"`, or `"no_assertions"` |
+| `results` | array | Per-step assertion results, in step order |
+| `skipped` | array | Per-step skip records, in step order |
 
-The `assert` command wraps these in an object with `scenario`, `network`,
-`results`, and `skipped_steps`.
+Each entry in `results` has `scenario`, `step_index`, `action`, `mode`
+(`min_balance` or `exists`), `account`, `network`, `asset`,
+`expected_min_balance` (string or null), `actual_balance` (string or null),
+`status` (`pass`, `fail`, or `error`), and `diagnostic`.
+
+Each entry in `skipped` has `step_index`, `action`, and `reason`
+(`would_mutate` or `not_executable`).
+
+Aggregation rules:
+- `errored` wins over everything (at least one error → `errored`)
+- then `failed` (at least one failure, no errors → `failed`)
+- then `passed` (at least one pass, no failures or errors)
+- otherwise `no_assertions`
+
+A skipped step is never counted as a pass. An error is never counted as a
+pass.
 
 ## Examples
 
 - `examples/payment.yml` — fund, pay, assert balance
 - `examples/auth_setup.yml` — fund an identity for authorization testing
 - `examples/assert_balance.yml` — read-only balance assertion
+- `examples/assert_asset.yml` — existence-only asset assertion
 
 ```bash
 stellar-scenario validate examples/payment.yml
 stellar-scenario plan examples/payment.yml
 stellar-scenario assert examples/assert_balance.yml
+stellar-scenario assert examples/assert_asset.yml
 ```
 
 ## Development
@@ -361,7 +421,7 @@ src/
   plan.rs         execution planning and side-effect classification
   runner.rs       subprocess adapter: argv, timeouts, structured errors
   stellar.rs      Stellar CLI discovery and read-only diagnostics
-  assert.rs       balance assertion model and execution
+  assert.rs       balance/asset assertion model, execution, and reporting
 tests/
   unit_tests.rs            parsing and validation unit tests
   integration_test.rs      validate command tests
@@ -402,9 +462,9 @@ green on a bare host.
   a live network.
 - The `--decimal` output mode is not parsed. Only the raw smallest-unit
   integer form is used, because it avoids floating-point rounding entirely.
-- Assertion results are per-step. There is no aggregate scenario verdict
-  beyond the process exit code.
 - Timeout is a fixed 120 seconds. It is not configurable per scenario.
+- `assert_asset` proves only that a balance entry exists; it does not prove
+  the balance is non-zero.
 
 ## Minimum Supported Rust Version
 

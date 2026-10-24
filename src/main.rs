@@ -4,7 +4,9 @@ use clap::Parser;
 use std::path::Path;
 use std::process::ExitCode;
 
-use stellar_scenario::assert::{AssertBalanceResult, AssertStatus};
+use stellar_scenario::assert::{
+    AssertBalanceResult, AssertionMode, ScenarioReport, ScenarioStatus, SkipReason, SkippedStep,
+};
 use stellar_scenario::cli::{Cli, Command, OutputFormat};
 use stellar_scenario::plan::{ExecutionPlan, SideEffect};
 use stellar_scenario::reporter::ValidationReport;
@@ -92,17 +94,24 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
     let plan = ExecutionPlan::build(&scenario, &executable.display().to_string());
 
     let mut results: Vec<AssertBalanceResult> = Vec::new();
-    let mut skipped: Vec<usize> = Vec::new();
+    let mut skipped: Vec<SkippedStep> = Vec::new();
 
     for (idx, step) in scenario.steps.iter().enumerate() {
         let planned = &plan.commands[idx];
         if planned.side_effect != SideEffect::ReadOnly {
-            skipped.push(idx);
+            skipped.push(SkippedStep {
+                step_index: idx,
+                action: step.action.clone(),
+                reason: SkipReason::WouldMutate,
+            });
             continue;
         }
-        if step.action != "assert_balance" {
-            // Read-only but not yet executable in this milestone.
-            skipped.push(idx);
+        if AssertionMode::for_action(&step.action).is_none() {
+            skipped.push(SkippedStep {
+                step_index: idx,
+                action: step.action.clone(),
+                reason: SkipReason::NotExecutable,
+            });
             continue;
         }
         results.push(AssertBalanceResult::execute(
@@ -113,46 +122,17 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
         ));
     }
 
-    let any_error = results.iter().any(|r| r.status == AssertStatus::Error);
-    let any_fail = results.iter().any(|r| r.status == AssertStatus::Fail);
+    let report = ScenarioReport::new(&scenario, results, skipped);
 
     match output {
-        OutputFormat::Json => {
-            let payload = serde_json::json!({
-                "scenario": scenario.name,
-                "network": scenario.network,
-                "results": results,
-                "skipped_steps": skipped,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_default()
-            );
-        }
-        OutputFormat::Text => {
-            for r in &results {
-                let mark = match r.status {
-                    AssertStatus::Pass => "PASS",
-                    AssertStatus::Fail => "FAIL",
-                    AssertStatus::Error => "ERROR",
-                };
-                eprintln!(
-                    "{mark}\t[{}]\t{} on {}\t{}",
-                    r.step_index, r.account, r.network, r.diagnostic
-                );
-            }
-            for idx in &skipped {
-                eprintln!("SKIP\t[{idx}]\tnot executable in this milestone");
-            }
-        }
+        OutputFormat::Json => println!("{}", report.to_json()),
+        OutputFormat::Text => eprintln!("{}", report.to_text()),
     }
 
-    if any_error {
-        ExitCode::from(2)
-    } else if any_fail {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+    match report.status {
+        ScenarioStatus::Errored => ExitCode::from(2),
+        ScenarioStatus::Failed => ExitCode::from(1),
+        ScenarioStatus::Passed | ScenarioStatus::NoAssertions => ExitCode::SUCCESS,
     }
 }
 

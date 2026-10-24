@@ -1,9 +1,8 @@
-//! Balance assertion model and execution.
+//! Balance assertion model, execution, and scenario-level reporting.
 //!
-//! This module implements the first read-only execution capability:
-//! `assert_balance`. It runs `stellar token balance --id <asset> --account
-//! <identity> --network <n> --output json`, parses the result, and compares
-//! it against an expected minimum.
+//! This module implements the read-only execution capabilities:
+//! `assert_balance` and `assert_asset`. Both run `stellar token balance`
+//! against a network, parse the result, and report it.
 //!
 //! # Safety
 //!
@@ -12,11 +11,39 @@
 //! - No secret key is accepted as input.
 //! - The only subprocess spawned is `stellar token balance`, which is a
 //!   read-only RPC call.
+//!
+//! # What a successful assertion proves
+//!
+//! A `pass` result proves that, at the moment the RPC read returned, the
+//! named account held at least `min_balance` of the named asset on the named
+//! network. It does not prove the balance is still that value later, and it
+//! is not a transaction confirmation.
 
 use std::str::FromStr;
 
 use crate::runner;
 use crate::scenario::{Scenario, Step};
+
+/// What an `assert_balance` or `assert_asset` step asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionMode {
+    /// `assert_balance` — require `actual >= min_balance`.
+    MinBalance,
+    /// `assert_asset` — require that a balance entry exists at all.
+    Exists,
+}
+
+impl AssertionMode {
+    /// Mode for a given action identifier.
+    pub fn for_action(action: &str) -> Option<Self> {
+        match action {
+            "assert_balance" => Some(Self::MinBalance),
+            "assert_asset" => Some(Self::Exists),
+            _ => None,
+        }
+    }
+}
 
 /// Result of a single balance assertion.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -26,15 +53,19 @@ pub struct AssertBalanceResult {
     pub scenario: String,
     /// Zero-based step index.
     pub step_index: usize,
+    /// Action that produced this result (`assert_balance` or `assert_asset`).
+    pub action: String,
+    /// Which comparison rule was applied.
+    pub mode: AssertionMode,
     /// Account that was queried.
     pub account: String,
     /// Network profile used.
     pub network: String,
     /// Asset identifier (`native`, `CODE:ISSUER`, or contract id).
     pub asset: String,
-    /// Expected minimum balance in the asset's smallest unit (stroops for
-    /// native XLM, or the token's smallest unit).
-    pub expected_min_balance: String,
+    /// Expected minimum balance in the asset's smallest unit. `None` for
+    /// existence-only assertions.
+    pub expected_min_balance: Option<String>,
     /// Actual balance returned by the CLI, when the query succeeded.
     pub actual_balance: Option<String>,
     /// Pass/fail/error outcome.
@@ -47,52 +78,137 @@ pub struct AssertBalanceResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssertStatus {
-    /// Actual balance >= expected minimum.
+    /// The assertion held.
     Pass,
-    /// Query succeeded but balance is below the expected minimum.
+    /// The query succeeded but the assertion did not hold.
     Fail,
     /// The balance query itself failed (CLI error, parse error, timeout).
     Error,
 }
 
-impl AssertBalanceResult {
-    /// Execute an `assert_balance` step.
-    ///
-    /// Returns a structured result regardless of success or failure.
-    pub fn execute(
-        scenario: &Scenario,
-        step_index: usize,
-        step: &Step,
-        executable: &std::path::Path,
-    ) -> Self {
+/// Context for building an `AssertBalanceResult`.
+#[derive(Debug, Clone)]
+struct AssertCtx<'a> {
+    scenario: &'a Scenario,
+    step_index: usize,
+    action: &'a str,
+    mode: AssertionMode,
+    account: String,
+    network: String,
+    asset: String,
+    expected_min_balance: Option<String>,
+}
+
+impl<'a> AssertCtx<'a> {
+    fn from_step(scenario: &'a Scenario, step_index: usize, step: &'a Step) -> Self {
         let account = step
             .params
             .get("identity")
             .and_then(|v| v.as_str())
             .unwrap_or("<missing>")
             .to_string();
-
         let asset = step
             .params
             .get("asset")
             .and_then(|v| v.as_str())
             .unwrap_or("native")
             .to_string();
+        let mode = AssertionMode::for_action(&step.action).unwrap_or(AssertionMode::MinBalance);
+        let expected_min_balance = if mode == AssertionMode::MinBalance {
+            Some(
+                step.params
+                    .get("min_balance")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
 
-        let expected_min_balance = step
-            .params
-            .get("min_balance")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0")
-            .to_string();
+        Self {
+            scenario,
+            step_index,
+            action: step.action.as_str(),
+            mode,
+            account,
+            network: scenario.network.clone(),
+            asset,
+            expected_min_balance,
+        }
+    }
+
+    fn pass(self, actual: &str, expected: &str) -> AssertBalanceResult {
+        let d = format!("balance {actual} >= expected {expected}");
+        self.build(actual, AssertStatus::Pass, &d)
+    }
+
+    fn fail(self, actual: &str, expected: &str) -> AssertBalanceResult {
+        let d = format!("balance {actual} < expected {expected}");
+        self.build(actual, AssertStatus::Fail, &d)
+    }
+
+    fn exists_pass(self, actual: &str) -> AssertBalanceResult {
+        let d = format!(
+            "balance entry exists for {} on {}",
+            self.asset, self.account
+        );
+        self.build(actual, AssertStatus::Pass, &d)
+    }
+
+    fn error(self, diagnostic: &str) -> AssertBalanceResult {
+        AssertBalanceResult {
+            scenario: self.scenario.name.clone(),
+            step_index: self.step_index,
+            action: self.action.to_string(),
+            mode: self.mode,
+            account: self.account,
+            network: self.network,
+            asset: self.asset,
+            expected_min_balance: self.expected_min_balance,
+            actual_balance: None,
+            status: AssertStatus::Error,
+            diagnostic: diagnostic.to_string(),
+        }
+    }
+
+    fn build(self, actual: &str, status: AssertStatus, diagnostic: &str) -> AssertBalanceResult {
+        AssertBalanceResult {
+            scenario: self.scenario.name.clone(),
+            step_index: self.step_index,
+            action: self.action.to_string(),
+            mode: self.mode,
+            account: self.account,
+            network: self.network,
+            asset: self.asset,
+            expected_min_balance: self.expected_min_balance,
+            actual_balance: Some(actual.to_string()),
+            status,
+            diagnostic: diagnostic.to_string(),
+        }
+    }
+}
+
+impl AssertBalanceResult {
+    /// Execute an `assert_balance` or `assert_asset` step.
+    ///
+    /// Returns a structured result regardless of success or failure. The
+    /// caller decides what to do with it; nothing here exits the process.
+    pub fn execute(
+        scenario: &Scenario,
+        step_index: usize,
+        step: &Step,
+        executable: &std::path::Path,
+    ) -> Self {
+        let ctx = AssertCtx::from_step(scenario, step_index, step);
 
         let args = vec![
             std::ffi::OsStr::new("token"),
             std::ffi::OsStr::new("balance"),
             std::ffi::OsStr::new("--id"),
-            std::ffi::OsStr::new(&asset),
+            std::ffi::OsStr::new(&ctx.asset),
             std::ffi::OsStr::new("--account"),
-            std::ffi::OsStr::new(&account),
+            std::ffi::OsStr::new(&ctx.account),
             std::ffi::OsStr::new("--network"),
             std::ffi::OsStr::new(&scenario.network),
             std::ffi::OsStr::new("--output"),
@@ -104,86 +220,21 @@ impl AssertBalanceResult {
 
         match run_result {
             Ok(output) => match parse_balance_json(&output.stdout) {
-                Ok(Some(balance_str)) => {
-                    let actual = balance_str;
-                    let expected = expected_min_balance.clone();
-                    match compare_balances(&actual, &expected) {
-                        std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
-                            let diag = format!("balance {} >= expected {}", actual, expected);
-                            Self {
-                                scenario: scenario.name.clone(),
-                                step_index,
-                                account,
-                                network: scenario.network.clone(),
-                                asset,
-                                expected_min_balance: expected,
-                                actual_balance: Some(actual),
-                                status: AssertStatus::Pass,
-                                diagnostic: diag,
+                Ok(actual) => match ctx.mode {
+                    AssertionMode::MinBalance => {
+                        let expected = ctx.expected_min_balance.clone().unwrap_or_default();
+                        match compare_balances(&actual, &expected) {
+                            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
+                                ctx.pass(&actual, &expected)
                             }
-                        }
-                        std::cmp::Ordering::Less => {
-                            let diag = format!("balance {} < expected {}", actual, expected);
-                            Self {
-                                scenario: scenario.name.clone(),
-                                step_index,
-                                account,
-                                network: scenario.network.clone(),
-                                asset,
-                                expected_min_balance: expected,
-                                actual_balance: Some(actual),
-                                status: AssertStatus::Fail,
-                                diagnostic: diag,
-                            }
+                            std::cmp::Ordering::Less => ctx.fail(&actual, &expected),
                         }
                     }
-                }
-                Ok(None) => Self::error(
-                    scenario,
-                    step_index,
-                    &account,
-                    &asset,
-                    &expected_min_balance,
-                    "balance field missing in JSON output",
-                ),
-                Err(e) => Self::error(
-                    scenario,
-                    step_index,
-                    &account,
-                    &asset,
-                    &expected_min_balance,
-                    &format!("failed to parse balance JSON: {e}"),
-                ),
+                    AssertionMode::Exists => ctx.exists_pass(&actual),
+                },
+                Err(e) => ctx.error(&format!("failed to parse balance JSON: {e}")),
             },
-            Err(e) => Self::error(
-                scenario,
-                step_index,
-                &account,
-                &asset,
-                &expected_min_balance,
-                &format!("stellar CLI error: {e}"),
-            ),
-        }
-    }
-
-    fn error(
-        scenario: &Scenario,
-        step_index: usize,
-        account: &str,
-        asset: &str,
-        expected: &str,
-        diagnostic: &str,
-    ) -> Self {
-        Self {
-            scenario: scenario.name.clone(),
-            step_index,
-            account: account.to_string(),
-            network: scenario.network.clone(),
-            asset: asset.to_string(),
-            expected_min_balance: expected.to_string(),
-            actual_balance: None,
-            status: AssertStatus::Error,
-            diagnostic: diagnostic.to_string(),
+            Err(e) => ctx.error(&format!("stellar CLI error: {e}")),
         }
     }
 }
@@ -192,9 +243,13 @@ impl AssertBalanceResult {
 ///
 /// Returns:
 /// - `Ok(Some(balance_str))` on success
-/// - `Ok(None)` when the JSON contains an error object
-/// - `Err(...)` when the JSON is malformed or missing expected fields
-fn parse_balance_json(stdout: &str) -> Result<Option<String>, String> {
+/// - `Err(...)` when the JSON carries an error object, is malformed, or is
+///   missing the `balance` field
+///
+/// There is deliberately no `Ok(None)` case: a balance query either returns a
+/// balance or fails. Collapsing "no balance" into a success path would let a
+/// missing account read as a zero balance.
+fn parse_balance_json(stdout: &str) -> Result<String, String> {
     let v: serde_json::Value = serde_json::from_str(stdout).map_err(|e| e.to_string())?;
     if let Some(error) = v.get("error") {
         let typ = error
@@ -214,7 +269,7 @@ fn parse_balance_json(stdout: &str) -> Result<Option<String>, String> {
     if balance.trim().is_empty() {
         return Err("balance is empty".to_string());
     }
-    Ok(Some(balance.to_string()))
+    Ok(balance.to_string())
 }
 
 /// Compare two balance strings as unsigned integers.
@@ -227,6 +282,194 @@ fn compare_balances(actual: &str, expected: &str) -> std::cmp::Ordering {
     a.cmp(&e)
 }
 
+// --------------------------------------------------------------------------
+// Scenario-level aggregate report
+// --------------------------------------------------------------------------
+
+/// Overall status of a scenario run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioStatus {
+    /// Every executed assertion passed.
+    Passed,
+    /// At least one assertion failed, none errored.
+    Failed,
+    /// At least one assertion errored.
+    Errored,
+    /// No assertion was executed (all steps skipped or none executable).
+    NoAssertions,
+}
+
+/// Aggregate report for one scenario run.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScenarioReport {
+    /// Scenario name.
+    pub scenario: String,
+    /// Schema version declared by the scenario file.
+    pub schema_version: String,
+    /// Network profile the run targeted.
+    pub network: String,
+    /// Total steps declared in the scenario.
+    pub total_steps: usize,
+    /// Assertions that passed.
+    pub passed: usize,
+    /// Assertions that failed.
+    pub failed: usize,
+    /// Assertions that errored.
+    pub errors: usize,
+    /// Steps skipped because they would mutate remote state.
+    pub skipped_mutating: usize,
+    /// Steps skipped because they are read-only but not yet executable.
+    pub skipped_not_executable: usize,
+    /// Overall status.
+    pub status: ScenarioStatus,
+    /// Per-step assertion results, in step order.
+    pub results: Vec<AssertBalanceResult>,
+    /// Per-step skip records, in step order.
+    pub skipped: Vec<SkippedStep>,
+}
+
+/// A step that was not executed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SkippedStep {
+    /// Zero-based step index.
+    pub step_index: usize,
+    /// Action name.
+    pub action: String,
+    /// Why the step was skipped.
+    pub reason: SkipReason,
+}
+
+/// Why a step was not executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The step would mutate remote state and is out of scope for `assert`.
+    WouldMutate,
+    /// The step is read-only but has no executor yet.
+    NotExecutable,
+}
+
+impl ScenarioReport {
+    /// Build a report from a scenario, its assertion results, and its skips.
+    ///
+    /// Aggregation is deterministic and order-independent:
+    /// - `errored` wins over everything (at least one error → `errored`)
+    /// - then `failed` (at least one failure, no errors → `failed`)
+    /// - then `passed` (at least one pass, no failures or errors)
+    /// - otherwise `no_assertions`
+    ///
+    /// A skipped step is never counted as a pass. An error is never counted
+    /// as a pass.
+    pub fn new(
+        scenario: &Scenario,
+        results: Vec<AssertBalanceResult>,
+        skipped: Vec<SkippedStep>,
+    ) -> Self {
+        let passed = results
+            .iter()
+            .filter(|r| r.status == AssertStatus::Pass)
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| r.status == AssertStatus::Fail)
+            .count();
+        let errors = results
+            .iter()
+            .filter(|r| r.status == AssertStatus::Error)
+            .count();
+        let skipped_mutating = skipped
+            .iter()
+            .filter(|s| s.reason == SkipReason::WouldMutate)
+            .count();
+        let skipped_not_executable = skipped
+            .iter()
+            .filter(|s| s.reason == SkipReason::NotExecutable)
+            .count();
+
+        let status = if errors > 0 {
+            ScenarioStatus::Errored
+        } else if failed > 0 {
+            ScenarioStatus::Failed
+        } else if passed > 0 {
+            ScenarioStatus::Passed
+        } else {
+            ScenarioStatus::NoAssertions
+        };
+
+        Self {
+            scenario: scenario.name.clone(),
+            schema_version: scenario.schema_version.clone(),
+            network: scenario.network.clone(),
+            total_steps: scenario.steps.len(),
+            passed,
+            failed,
+            errors,
+            skipped_mutating,
+            skipped_not_executable,
+            status,
+            results,
+            skipped,
+        }
+    }
+
+    /// Serialize to pretty JSON with a trailing newline.
+    pub fn to_json(&self) -> String {
+        let mut s = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string());
+        s.push('\n');
+        s
+    }
+
+    /// Render a human-readable summary.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "{} on {}: {} ({} step(s), {} passed, {} failed, {} error(s), {} skipped)\n",
+            self.scenario,
+            self.network,
+            status_label(self.status),
+            self.total_steps,
+            self.passed,
+            self.failed,
+            self.errors,
+            self.skipped_mutating + self.skipped_not_executable
+        ));
+        for r in &self.results {
+            let mark = match r.status {
+                AssertStatus::Pass => "PASS",
+                AssertStatus::Fail => "FAIL",
+                AssertStatus::Error => "ERROR",
+            };
+            out.push_str(&format!(
+                "  {mark}\t[{}]\t{} on {}\t{}\n",
+                r.step_index, r.account, r.network, r.diagnostic
+            ));
+        }
+        for s in &self.skipped {
+            let reason = match s.reason {
+                SkipReason::WouldMutate => "would mutate remote state",
+                SkipReason::NotExecutable => "no executor yet",
+            };
+            out.push_str(&format!(
+                "  SKIP\t[{}]\t{}\t{}\n",
+                s.step_index, s.action, reason
+            ));
+        }
+        out
+    }
+}
+
+fn status_label(status: ScenarioStatus) -> &'static str {
+    match status {
+        ScenarioStatus::Passed => "passed",
+        ScenarioStatus::Failed => "failed",
+        ScenarioStatus::Errored => "errored",
+        ScenarioStatus::NoAssertions => "no assertions",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,7 +477,7 @@ mod tests {
     #[test]
     fn parse_success_json() {
         let out = parse_balance_json("{\"balance\":\"12345\"}\n").unwrap();
-        assert_eq!(out, Some("12345".to_string()));
+        assert_eq!(out, "12345");
     }
 
     #[test]
@@ -256,7 +499,6 @@ mod tests {
     #[test]
     fn parse_malformed_json() {
         let err = parse_balance_json("not json").unwrap_err();
-        // serde_json's message varies by version; assert on the stable part.
         assert!(
             err.contains("json") || err.contains("expected") || err.contains("line 1"),
             "unexpected message: {err}"
@@ -273,6 +515,16 @@ mod tests {
     }
 
     #[test]
+    fn compare_balances_boundary_values() {
+        use std::cmp::Ordering;
+        // u128 max, well beyond any real balance.
+        let max = u128::MAX.to_string();
+        assert_eq!(compare_balances(&max, "1"), Ordering::Greater);
+        assert_eq!(compare_balances(&max, &max), Ordering::Equal);
+        assert_eq!(compare_balances("1", &max), Ordering::Less);
+    }
+
+    #[test]
     fn compare_balances_malformed_falls_back_to_zero() {
         use std::cmp::Ordering;
         assert_eq!(compare_balances("nope", "0"), Ordering::Equal);
@@ -280,44 +532,308 @@ mod tests {
     }
 
     #[test]
-    fn result_serializes_to_json() {
-        let r = AssertBalanceResult {
-            scenario: "s".into(),
-            step_index: 0,
-            account: "GABC".into(),
-            network: "testnet".into(),
+    fn mode_for_action() {
+        assert_eq!(
+            AssertionMode::for_action("assert_balance"),
+            Some(AssertionMode::MinBalance)
+        );
+        assert_eq!(
+            AssertionMode::for_action("assert_asset"),
+            Some(AssertionMode::Exists)
+        );
+        assert_eq!(AssertionMode::for_action("payment"), None);
+    }
+
+    fn scenario_with(raw: &str) -> Scenario {
+        Scenario::from_str(raw).unwrap()
+    }
+
+    fn result(
+        scenario: &Scenario,
+        idx: usize,
+        action: &str,
+        mode: AssertionMode,
+        status: AssertStatus,
+        actual: Option<&str>,
+    ) -> AssertBalanceResult {
+        AssertBalanceResult {
+            scenario: scenario.name.clone(),
+            step_index: idx,
+            action: action.to_string(),
+            mode,
+            account: "alice".into(),
+            network: scenario.network.clone(),
             asset: "native".into(),
-            expected_min_balance: "100".into(),
-            actual_balance: Some("200".into()),
-            status: AssertStatus::Pass,
-            diagnostic: "ok".into(),
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(json.contains("\"status\":\"pass\""));
-        assert!(json.contains("\"actual_balance\":\"200\""));
+            expected_min_balance: if mode == AssertionMode::MinBalance {
+                Some("1".into())
+            } else {
+                None
+            },
+            actual_balance: actual.map(String::from),
+            status,
+            diagnostic: "d".into(),
+        }
+    }
+
+    #[test]
+    fn report_all_pass() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![],
+        );
+        assert_eq!(rep.status, ScenarioStatus::Passed);
+        assert_eq!(rep.passed, 1);
+        assert_eq!(rep.failed, 0);
+        assert_eq!(rep.errors, 0);
+        assert_eq!(rep.total_steps, 1);
+    }
+
+    #[test]
+    fn report_error_beats_failure() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+        );
+        let results = vec![
+            result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Fail,
+                Some("0"),
+            ),
+            result(
+                &s,
+                1,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Error,
+                None,
+            ),
+        ];
+        let rep = ScenarioReport::new(&s, results, vec![]);
+        assert_eq!(rep.status, ScenarioStatus::Errored);
+        assert_eq!(rep.failed, 1);
+        assert_eq!(rep.errors, 1);
+    }
+
+    #[test]
+    fn report_failure_beats_pass() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+        );
+        let results = vec![
+            result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            ),
+            result(
+                &s,
+                1,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Fail,
+                Some("0"),
+            ),
+        ];
+        let rep = ScenarioReport::new(&s, results, vec![]);
+        assert_eq!(rep.status, ScenarioStatus::Failed);
+        assert_eq!(rep.passed, 1);
+        assert_eq!(rep.failed, 1);
+    }
+
+    #[test]
+    fn report_skipped_is_not_a_pass() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+  - action: payment
+    from: alice
+    to: bob
+    amount: "1"
+"#,
+        );
+        let skipped = vec![
+            SkippedStep {
+                step_index: 0,
+                action: "ensure_funded".into(),
+                reason: SkipReason::WouldMutate,
+            },
+            SkippedStep {
+                step_index: 1,
+                action: "payment".into(),
+                reason: SkipReason::WouldMutate,
+            },
+        ];
+        let rep = ScenarioReport::new(&s, vec![], skipped);
+        assert_eq!(rep.status, ScenarioStatus::NoAssertions);
+        assert_eq!(rep.passed, 0);
+        assert_eq!(rep.skipped_mutating, 2);
+    }
+
+    #[test]
+    fn report_no_assertions_when_nothing_executed() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![],
+            vec![SkippedStep {
+                step_index: 0,
+                action: "ensure_funded".into(),
+                reason: SkipReason::WouldMutate,
+            }],
+        );
+        assert_eq!(rep.status, ScenarioStatus::NoAssertions);
+    }
+
+    #[test]
+    fn report_serializes_stably() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![],
+        );
+        let json = rep.to_json();
+        assert!(json.contains("\"status\": \"passed\""));
+        assert!(json.contains("\"passed\": 1"));
+        assert!(json.contains("\"total_steps\": 1"));
+        assert!(json.contains("\"schema_version\": \"1.0\""));
+        // Field order is deterministic: struct declaration order.
+        let scenario_pos = json.find("\"scenario\"").unwrap();
+        let status_pos = json.find("\"status\"").unwrap();
+        assert!(scenario_pos < status_pos);
+    }
+
+    #[test]
+    fn report_text_lists_skips() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![],
+            vec![SkippedStep {
+                step_index: 0,
+                action: "ensure_funded".into(),
+                reason: SkipReason::WouldMutate,
+            }],
+        );
+        let text = rep.to_text();
+        assert!(text.contains("SKIP"));
+        assert!(text.contains("ensure_funded"));
+        assert!(text.contains("no assertions"));
     }
 
     #[test]
     fn result_error_has_no_actual_balance() {
-        let r = AssertBalanceResult::error(
-            &Scenario::from_str(
-                r#"schema_version: "1.0"
+        let s = scenario_with(
+            r#"schema_version: "1.0"
 name: x
 network: testnet
 steps:
   - action: assert_balance
     identity: alice
+    min_balance: "1"
 "#,
-            )
-            .unwrap(),
-            0,
-            "alice",
-            "native",
-            "100",
-            "timeout",
         );
+        let r = AssertCtx::from_step(&s, 0, &s.steps[0]).error("timeout");
         assert_eq!(r.status, AssertStatus::Error);
         assert!(r.actual_balance.is_none());
         assert!(r.diagnostic.contains("timeout"));
+        assert_eq!(r.expected_min_balance.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn exists_mode_omits_expected_balance() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: assert_asset
+    identity: alice
+"#,
+        );
+        let r = AssertCtx::from_step(&s, 0, &s.steps[0]).exists_pass("0");
+        assert_eq!(r.status, AssertStatus::Pass);
+        assert!(r.expected_min_balance.is_none());
+        assert_eq!(r.actual_balance.as_deref(), Some("0"));
     }
 }

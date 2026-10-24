@@ -120,10 +120,11 @@ impl Scenario {
                 "ensure_funded" => validate_ensure_funded(step, idx, &mut issues),
                 "payment" => validate_payment(step, idx, &mut issues),
                 "assert_balance" => validate_assert_balance(step, idx, &mut issues),
+                "assert_asset" => validate_assert_asset(step, idx, &mut issues),
                 other => issues.push(ValidationIssue {
                     field,
                     message: format!(
-                        "unknown action '{other}'; supported actions: ensure_funded, payment, assert_balance"
+                        "unknown action '{other}'; supported actions: ensure_funded, payment, assert_balance, assert_asset"
                     ),
                     line: None,
                 }),
@@ -144,6 +145,7 @@ pub enum Action {
     EnsureFunded,
     Payment,
     AssertBalance,
+    AssertAsset,
 }
 
 impl Action {
@@ -154,6 +156,7 @@ impl Action {
             "ensure_funded" => Some(Self::EnsureFunded),
             "payment" => Some(Self::Payment),
             "assert_balance" => Some(Self::AssertBalance),
+            "assert_asset" => Some(Self::AssertAsset),
             _ => None,
         }
     }
@@ -190,15 +193,32 @@ fn validate_payment(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) 
 
 fn validate_assert_balance(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
     require_string(step, idx, "identity", issues);
-    if let Some(v) = step.params.get("min_balance") {
-        if !is_non_negative_integer(v) {
+    match step.params.get("min_balance") {
+        None => issues.push(ValidationIssue {
+            field: format!("steps[{idx}].min_balance"),
+            message: "min_balance is required for assert_balance; use assert_asset for an existence-only check".into(),
+            line: None,
+        }),
+        Some(v) if !is_non_negative_integer(v) => issues.push(ValidationIssue {
+            field: format!("steps[{idx}].min_balance"),
+            message: "min_balance must be a non-negative integer, or a string of digits".into(),
+            line: None,
+        }),
+        _ => {}
+    }
+    if let Some(v) = step.params.get("asset") {
+        if !v.is_string() {
             issues.push(ValidationIssue {
-                field: format!("steps[{idx}].min_balance"),
-                message: "min_balance must be a non-negative integer, or a string of digits".into(),
+                field: format!("steps[{idx}].asset"),
+                message: "asset must be a string (e.g. 'native' or 'CODE:ISSUER')".into(),
                 line: None,
             });
         }
     }
+}
+
+fn validate_assert_asset(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
+    require_string(step, idx, "identity", issues);
     if let Some(v) = step.params.get("asset") {
         if !v.is_string() {
             issues.push(ValidationIssue {

@@ -37,7 +37,7 @@ fn assert_cmd(path: &str) -> Command {
 
 #[test]
 fn assert_rejects_invalid_scenario() {
-    assert_cmd(&fixture("invalid_assert_negative_balance.yml"))
+    assert_cmd(&fixture("invalid_assert_missing_min_balance.yml"))
         .assert()
         .failure()
         .code(1)
@@ -45,7 +45,7 @@ fn assert_rejects_invalid_scenario() {
 }
 
 #[test]
-fn assert_emits_structured_json() {
+fn assert_emits_structured_report() {
     if !stellar_available() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
@@ -63,7 +63,12 @@ fn assert_emits_structured_json() {
         Some("assert_preview_balance")
     );
     assert!(parsed.get("results").is_some(), "missing results array");
-    assert!(parsed.get("skipped_steps").is_some());
+    assert!(parsed.get("skipped").is_some(), "missing skipped array");
+    assert!(parsed.get("status").is_some(), "missing status");
+    assert_eq!(
+        parsed.get("schema_version").and_then(|v| v.as_str()),
+        Some("1.0")
+    );
 }
 
 #[test]
@@ -73,8 +78,6 @@ fn assert_skips_mutating_steps() {
         return;
     }
 
-    // The payment scenario funds and pays. `assert` must skip those steps
-    // rather than execute them.
     let payment = project_root().join("examples/payment.yml");
     let output = assert_cmd(payment.to_str().unwrap())
         .output()
@@ -83,16 +86,18 @@ fn assert_skips_mutating_steps() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = stdout.parse().unwrap();
     let skipped = parsed
-        .get("skipped_steps")
+        .get("skipped")
         .and_then(|v| v.as_array())
-        .expect("skipped_steps array");
+        .expect("skipped array");
 
-    // Steps 0 (ensure_funded) and 1 (payment) mutate remote state.
     assert_eq!(skipped.len(), 2, "skipped: {skipped:?}");
-    assert!(skipped.contains(&serde_json::json!(0)));
-    assert!(skipped.contains(&serde_json::json!(1)));
+    let actions: Vec<_> = skipped
+        .iter()
+        .filter_map(|s| s.get("action").and_then(|v| v.as_str()))
+        .collect();
+    assert!(actions.contains(&"ensure_funded"));
+    assert!(actions.contains(&"payment"));
 
-    // Only the read-only assert_balance step produced a result.
     let results = parsed
         .get("results")
         .and_then(|v| v.as_array())
@@ -111,9 +116,6 @@ fn assert_never_invokes_funding_or_payment() {
         return;
     }
 
-    // A scenario whose only steps are ensure_funded and payment must produce
-    // zero executed results. If the runner ever started executing those,
-    // this test would see results and fail.
     let raw = r#"
 schema_version: "1.0"
 name: mutating_only
@@ -146,9 +148,9 @@ steps:
     );
 
     let skipped = parsed
-        .get("skipped_steps")
+        .get("skipped")
         .and_then(|v| v.as_array())
-        .expect("skipped_steps array");
+        .expect("skipped array");
     assert_eq!(skipped.len(), 2);
 }
 
@@ -202,8 +204,6 @@ fn assert_against_funded_account_passes() {
         return;
     }
 
-    // `deployer` is a pre-existing funded testnet identity on this host.
-    // If it is absent, the query returns an error and the test skips.
     let raw = r#"
 schema_version: "1.0"
 name: live_pass_probe
@@ -238,15 +238,7 @@ steps:
         }
         panic!("unexpected error status: {diag}");
     }
-    assert_eq!(
-        status,
-        "pass",
-        "diagnostic: {}",
-        results[0]
-            .get("diagnostic")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-    );
+    assert_eq!(status, "pass");
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -326,4 +318,183 @@ steps:
     assert_eq!(status, "error", "unknown identity must be an error");
     assert!(results[0].get("actual_balance").unwrap().is_null());
     assert_eq!(output.status.code(), Some(2));
+}
+
+// ------------------------------------------------------- report-level tests
+
+#[test]
+fn assert_report_status_precedence() {
+    // Offline: build a report manually and verify precedence:
+    // errored > failed > passed > no_assertions.
+    use stellar_scenario::assert::{
+        AssertBalanceResult, AssertionMode, ScenarioReport, ScenarioStatus,
+    };
+    use stellar_scenario::scenario::Scenario;
+
+    let s = Scenario::from_str(
+        r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+    )
+    .unwrap();
+
+    let results = vec![
+        AssertBalanceResult {
+            scenario: s.name.clone(),
+            step_index: 0,
+            action: "assert_balance".into(),
+            mode: AssertionMode::MinBalance,
+            account: "alice".into(),
+            network: s.network.clone(),
+            asset: "native".into(),
+            expected_min_balance: Some("1".into()),
+            actual_balance: Some("0".into()),
+            status: stellar_scenario::assert::AssertStatus::Fail,
+            diagnostic: "balance 0 < expected 1".into(),
+        },
+        AssertBalanceResult {
+            scenario: s.name.clone(),
+            step_index: 1,
+            action: "assert_balance".into(),
+            mode: AssertionMode::MinBalance,
+            account: "bob".into(),
+            network: s.network.clone(),
+            asset: "native".into(),
+            expected_min_balance: Some("1".into()),
+            actual_balance: None,
+            status: stellar_scenario::assert::AssertStatus::Error,
+            diagnostic: "timeout".into(),
+        },
+    ];
+    let rep = ScenarioReport::new(&s, results, vec![]);
+    assert_eq!(rep.status, ScenarioStatus::Errored);
+    assert_eq!(rep.errors, 1);
+    assert_eq!(rep.failed, 1);
+    assert_eq!(rep.passed, 0);
+}
+
+#[test]
+fn assert_report_no_assertions_when_all_skipped() {
+    use stellar_scenario::assert::{ScenarioReport, ScenarioStatus, SkipReason, SkippedStep};
+    use stellar_scenario::scenario::Scenario;
+
+    let s = Scenario::from_str(
+        r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+"#,
+    )
+    .unwrap();
+    let rep = ScenarioReport::new(
+        &s,
+        vec![],
+        vec![SkippedStep {
+            step_index: 0,
+            action: "ensure_funded".into(),
+            reason: SkipReason::WouldMutate,
+        }],
+    );
+    assert_eq!(rep.status, ScenarioStatus::NoAssertions);
+    assert_eq!(rep.passed, 0);
+    assert_eq!(rep.skipped_mutating, 1);
+}
+
+#[test]
+fn assert_report_json_has_stable_field_order() {
+    use stellar_scenario::assert::{AssertBalanceResult, AssertionMode, ScenarioReport};
+    use stellar_scenario::scenario::Scenario;
+
+    let s = Scenario::from_str(
+        r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+    )
+    .unwrap();
+    let rep = ScenarioReport::new(
+        &s,
+        vec![AssertBalanceResult {
+            scenario: s.name.clone(),
+            step_index: 0,
+            action: "assert_balance".into(),
+            mode: AssertionMode::MinBalance,
+            account: "alice".into(),
+            network: s.network.clone(),
+            asset: "native".into(),
+            expected_min_balance: Some("1".into()),
+            actual_balance: Some("5".into()),
+            status: stellar_scenario::assert::AssertStatus::Pass,
+            diagnostic: "ok".into(),
+        }],
+        vec![],
+    );
+    let json = rep.to_json();
+    let scenario_pos = json.find("\"scenario\"").unwrap();
+    let status_pos = json.find("\"status\"").unwrap();
+    assert!(scenario_pos < status_pos);
+    assert!(json.contains("\"schema_version\": \"1.0\""));
+    assert!(json.contains("\"total_steps\": 1"));
+}
+
+#[test]
+fn assert_report_text_lists_passes_fails_errors_and_skips() {
+    use stellar_scenario::assert::{
+        AssertBalanceResult, AssertionMode, ScenarioReport, SkipReason, SkippedStep,
+    };
+    use stellar_scenario::scenario::Scenario;
+
+    let s = Scenario::from_str(
+        r#"schema_version: "1.0"
+name: r
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+    )
+    .unwrap();
+    let rep = ScenarioReport::new(
+        &s,
+        vec![AssertBalanceResult {
+            scenario: s.name.clone(),
+            step_index: 1,
+            action: "assert_balance".into(),
+            mode: AssertionMode::MinBalance,
+            account: "bob".into(),
+            network: s.network.clone(),
+            asset: "native".into(),
+            expected_min_balance: Some("1".into()),
+            actual_balance: Some("0".into()),
+            status: stellar_scenario::assert::AssertStatus::Fail,
+            diagnostic: "balance 0 < expected 1".into(),
+        }],
+        vec![SkippedStep {
+            step_index: 0,
+            action: "ensure_funded".into(),
+            reason: SkipReason::WouldMutate,
+        }],
+    );
+    let text = rep.to_text();
+    assert!(text.contains("failed"));
+    assert!(text.contains("FAIL"));
+    assert!(text.contains("SKIP"));
+    assert!(text.contains("ensure_funded"));
 }

@@ -1,6 +1,5 @@
 //! Stellar Scenario Kit — a local-first toolkit for defining, validating,
-//! and (in later milestones) executing reproducible Stellar/Soroban
-//! development scenarios.
+//! and executing reproducible Stellar/Soroban development scenarios.
 //!
 //! # Exit code contract
 //!
@@ -8,9 +7,9 @@
 //!
 //! | Code | Meaning |
 //! |------|---------|
-//! | 0 | Success — scenario is valid |
-//! | 1 | Validation failed — the file parsed but broke a schema or semantic rule |
-//! | 2 | I/O error, YAML parse error, or unexpected internal error |
+//! | 0 | Success — scenario is valid, or every assertion passed |
+//! | 1 | Validation failed, or an assertion failed |
+//! | 2 | I/O error, YAML parse error, assertion query error, or internal error |
 
 pub mod assert;
 pub mod cli;
