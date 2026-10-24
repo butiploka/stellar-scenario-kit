@@ -21,6 +21,8 @@ Implemented:
   execute, without executing anything
 - `stellar-scenario assert` — execute read-only `assert_balance` and
   `assert_asset` steps, with a structured aggregate report
+- `stellar-scenario simulate` — build and simulate Soroban invoke envelopes
+  without submitting anything
 - `stellar-scenario doctor` — report environment readiness
 - Versioned schema (`schema_version: "1.0"`)
 - Semantic validation of steps, actions, and fields
@@ -178,6 +180,58 @@ assert_native_balance on testnet: passed (1 step(s), 1 passed, 0 failed, 0 error
   PASS	[0]	deployer on testnet	balance 99282512062 >= expected 1
 ```
 
+### Simulate a transaction
+
+```bash
+stellar-scenario simulate examples/simulate_invoke.yml
+```
+
+```json
+{
+  "scenario": "simulate_native_balance",
+  "schema_version": "1.0",
+  "network": "testnet",
+  "total_steps": 1,
+  "simulated": 1,
+  "unsupported": 0,
+  "failed": 0,
+  "skipped": 0,
+  "status": "simulated",
+  "submitted": false,
+  "results": [
+    {
+      "scenario": "simulate_native_balance",
+      "step_index": 0,
+      "action": "simulate_invoke",
+      "network": "testnet",
+      "source": "GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26",
+      "contract_id": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "function": "balance",
+      "simulated": true,
+      "submitted": false,
+      "status": "simulated",
+      "envelope_sha256": "b7775547cb49791cf3d64c1823f9f0999086e8823d7c2a20871885ba044112b6",
+      "resources": {
+        "fee": "7266",
+        "instructions": 141406
+      },
+      "diagnostic": "envelope simulated; not submitted"
+    }
+  ]
+}
+```
+
+Human-readable output on stderr:
+
+```bash
+stellar-scenario simulate examples/simulate_invoke.yml --output text
+```
+
+```
+simulate_native_balance on testnet: simulated (1 step(s), 1 simulated, 0 unsupported, 0 failed, 0 skipped) [not submitted]
+  SIMULATED	[0]	CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC::balance on testnet	envelope simulated; not submitted
+```
+
 ### Check the environment
 
 ```bash
@@ -201,9 +255,9 @@ stellar-scenario doctor
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success — scenario is valid, plan produced, or all assertions passed |
-| 1 | Semantic validation failed, an assertion failed, or a `doctor` check failed |
-| 2 | I/O error, YAML parse error, assertion query error, or unexpected internal error |
+| 0 | Success — scenario is valid, plan produced, all assertions passed, or all simulations simulated |
+| 1 | Semantic validation failed, an assertion failed, a `doctor` check failed, or a simulation was refused as unsupported |
+| 2 | I/O error, YAML parse error, assertion query error, simulation failure, or unexpected internal error |
 
 The split between 1 and 2 matters for CI: a schema or semantic problem is a
 bug in the scenario file, while a parse or I/O failure usually means the file
@@ -301,6 +355,43 @@ would add schema surface with no concrete use case.
 | `payment` | `from`, `to`, `amount` | `asset` | Mutates remote state |
 | `assert_balance` | `identity`, `min_balance` | `asset` | Read only |
 | `assert_asset` | `identity` | `asset` | Read only |
+| `simulate_invoke` | `contract_id`, `function` | `source`, `args` | Read only |
+
+### `simulate_invoke` semantics
+
+- `contract_id` — the Soroban contract to invoke, as a `C...` contract id.
+- `function` — the function name to invoke.
+- `source` — the account the envelope is built for. Accepts an identity name
+  or a `G...` public key. Falls back to the scenario-level `source`. Secret
+  keys are not accepted.
+- `args` — arguments passed to the contract function, as a list of strings in
+  the CLI's own `--flag value` form, e.g. `["--to", "world"]`.
+
+The command runs three read-only subprocesses:
+
+1. `stellar contract invoke ... --build-only` — builds the envelope without
+   signing or submitting.
+2. `stellar tx simulate ...` — simulates it against the RPC.
+3. `stellar tx decode` — decodes the simulated envelope to read fee and
+   resource figures.
+
+**A simulated result is not a confirmed transaction.** `stellar tx simulate`
+asks the RPC to execute the transaction against a ledger snapshot and return
+the resources and fees it would need. Nothing is written. The report carries
+`"submitted": false` on every result and on the report itself, and the text
+summary ends with `[not submitted]`.
+
+**Classic operations are not supported.** `stellar tx simulate` rejects
+non-Soroban operations:
+
+```
+❌ error: transaction simulation failed: transaction contains unsupported
+operation type: OperationTypePayment
+```
+
+That case is reported as `status: "unsupported_operation"` with exit code 1,
+not as a simulation that ran. Payments, account creation, and other classic
+operations are not simulatable through this path.
 
 ### `assert_balance` semantics
 

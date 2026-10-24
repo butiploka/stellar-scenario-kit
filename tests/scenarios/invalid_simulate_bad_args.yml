@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: simulate_invoke_bad_args
+network: testnet
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: balance
+    args: "--id value"

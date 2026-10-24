@@ -12,6 +12,7 @@ use stellar_scenario::plan::{ExecutionPlan, SideEffect};
 use stellar_scenario::reporter::ValidationReport;
 use stellar_scenario::runner::find_stellar_cli;
 use stellar_scenario::scenario::Scenario;
+use stellar_scenario::simulate::{SimulationReport, SimulationReportStatus, SimulationResult};
 use stellar_scenario::stellar;
 
 fn main() -> ExitCode {
@@ -21,6 +22,7 @@ fn main() -> ExitCode {
         Command::Validate { file, output } => run_validate(&file, output),
         Command::Plan { file, output } => run_plan(&file, output),
         Command::Assert { file, output } => run_assert(&file, output),
+        Command::Simulate { file, output } => run_simulate(&file, output),
         Command::Doctor { output } => run_doctor(output),
     }
 }
@@ -159,5 +161,63 @@ fn run_doctor(output: OutputFormat) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn run_simulate(file: &Path, output: OutputFormat) -> ExitCode {
+    let scenario = match Scenario::from_file(file) {
+        Ok(s) => s,
+        Err(e) => {
+            let report = ValidationReport::invalid(file, &e);
+            match output {
+                OutputFormat::Json => println!("{}", report.to_json()),
+                OutputFormat::Text => eprintln!("{}", report.to_text()),
+            }
+            return ExitCode::from(e.exit_code() as u8);
+        }
+    };
+
+    let executable = match find_stellar_cli(None) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("stellar CLI unavailable: {e}");
+            match output {
+                OutputFormat::Json => println!("{{\"error\":\"{msg}\"}}"),
+                OutputFormat::Text => eprintln!("error: {msg}"),
+            }
+            return ExitCode::from(2);
+        }
+    };
+
+    let plan = ExecutionPlan::build(&scenario, &executable.display().to_string());
+
+    let mut results: Vec<SimulationResult> = Vec::new();
+    let mut skipped: usize = 0;
+
+    for (idx, step) in scenario.steps.iter().enumerate() {
+        let planned = &plan.commands[idx];
+        if planned.side_effect != SideEffect::ReadOnly {
+            skipped += 1;
+            continue;
+        }
+        if step.action != "simulate_invoke" {
+            skipped += 1;
+            continue;
+        }
+        results.push(SimulationResult::execute(&scenario, idx, step, &executable));
+    }
+
+    let report = SimulationReport::new(&scenario, results, skipped);
+
+    match output {
+        OutputFormat::Json => println!("{}", report.to_json()),
+        OutputFormat::Text => eprintln!("{}", report.to_text()),
+    }
+
+    match report.status {
+        SimulationReportStatus::Failed => ExitCode::from(2),
+        SimulationReportStatus::UnsupportedOperation => ExitCode::from(1),
+        SimulationReportStatus::Simulated => ExitCode::SUCCESS,
+        SimulationReportStatus::NoSimulations => ExitCode::SUCCESS,
     }
 }

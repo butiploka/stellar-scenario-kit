@@ -190,6 +190,39 @@ fn plan_step(index: usize, step: &Step, scenario: &Scenario, executable: &str) -
                 SideEffect::ReadOnly,
             )
         }
+        "simulate_invoke" => {
+            let contract_id = step
+                .params
+                .get("contract_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unset>");
+            let function = step
+                .params
+                .get("function")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unset>");
+            let mut args = vec![
+                "contract".to_string(),
+                "invoke".to_string(),
+                "--contract-id".to_string(),
+                contract_id.to_string(),
+                "--source-account".to_string(),
+                source.to_string(),
+                "--network".to_string(),
+                scenario.network.clone(),
+                "--build-only".to_string(),
+                "--".to_string(),
+                function.to_string(),
+            ];
+            if let Some(seq) = step.params.get("args").and_then(|v| v.as_sequence()) {
+                for item in seq {
+                    if let Some(s) = item.as_str() {
+                        args.push(s.to_string());
+                    }
+                }
+            }
+            (args, SideEffect::ReadOnly)
+        }
         other => (vec![other.to_string()], SideEffect::ReadOnly),
     };
 

@@ -49,6 +49,20 @@ pub enum Command {
         output: OutputFormat,
     },
 
+    /// Simulate `simulate_invoke` steps without submitting anything.
+    ///
+    /// Builds a Soroban invoke envelope, simulates it against the network,
+    /// and decodes the simulated result. No transaction is ever submitted.
+    /// Classic operations (payments, account creation) are rejected by
+    /// `stellar tx simulate` and reported as unsupported.
+    Simulate {
+        /// Path to a YAML scenario file.
+        file: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        output: OutputFormat,
+    },
+
     /// Report environment readiness.
     ///
     /// Checks whether the Stellar CLI is available and what it reports.

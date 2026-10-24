@@ -158,10 +158,11 @@ impl Scenario {
                 "payment" => validate_payment(step, idx, &mut issues),
                 "assert_balance" => validate_assert_balance(step, idx, &mut issues),
                 "assert_asset" => validate_assert_asset(step, idx, &mut issues),
+                "simulate_invoke" => validate_simulate_invoke(step, idx, &mut issues),
                 other => issues.push(ValidationIssue {
                     field,
                     message: format!(
-                        "unknown action '{other}'; supported actions: ensure_funded, payment, assert_balance, assert_asset"
+                        "unknown action '{other}'; supported actions: ensure_funded, payment, assert_balance, assert_asset, simulate_invoke"
                     ),
                     line: None,
                 }),
@@ -183,6 +184,7 @@ pub enum Action {
     Payment,
     AssertBalance,
     AssertAsset,
+    SimulateInvoke,
 }
 
 impl Action {
@@ -194,6 +196,7 @@ impl Action {
             "payment" => Some(Self::Payment),
             "assert_balance" => Some(Self::AssertBalance),
             "assert_asset" => Some(Self::AssertAsset),
+            "simulate_invoke" => Some(Self::SimulateInvoke),
             _ => None,
         }
     }
@@ -263,6 +266,41 @@ fn validate_assert_asset(step: &Step, idx: usize, issues: &mut Vec<ValidationIss
                 message: "asset must be a string (e.g. 'native' or 'CODE:ISSUER')".into(),
                 line: None,
             });
+        }
+    }
+}
+
+fn validate_simulate_invoke(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
+    require_string(step, idx, "contract_id", issues);
+    require_string(step, idx, "function", issues);
+    // `source` is optional; it falls back to the scenario-level `source`.
+    if let Some(v) = step.params.get("source") {
+        if !v.is_string() {
+            issues.push(ValidationIssue {
+                field: format!("steps[{idx}].source"),
+                message: "source must be a string (an identity name or a G... public key)".into(),
+                line: None,
+            });
+        }
+    }
+    if let Some(v) = step.params.get("args") {
+        match v.as_sequence() {
+            None => issues.push(ValidationIssue {
+                field: format!("steps[{idx}].args"),
+                message: "args must be a list of strings, e.g. [\"--to\", \"world\"]".into(),
+                line: None,
+            }),
+            Some(seq) => {
+                for (i, item) in seq.iter().enumerate() {
+                    if !item.is_string() {
+                        issues.push(ValidationIssue {
+                            field: format!("steps[{idx}].args[{i}]"),
+                            message: "each arg must be a string".into(),
+                            line: None,
+                        });
+                    }
+                }
+            }
         }
     }
 }

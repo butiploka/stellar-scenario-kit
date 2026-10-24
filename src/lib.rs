@@ -18,6 +18,7 @@ pub mod plan;
 pub mod reporter;
 pub mod runner;
 pub mod scenario;
+pub mod simulate;
 pub mod stellar;
 
 /// Crate version, taken from `Cargo.toml`.

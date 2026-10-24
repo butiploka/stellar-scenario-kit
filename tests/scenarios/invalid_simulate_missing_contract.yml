@@ -1,0 +1,6 @@
+schema_version: "1.0"
+name: simulate_invoke_missing_contract
+network: testnet
+steps:
+  - action: simulate_invoke
+    function: balance
