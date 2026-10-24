@@ -191,10 +191,19 @@ fn validate_payment(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) 
 fn validate_assert_balance(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
     require_string(step, idx, "identity", issues);
     if let Some(v) = step.params.get("min_balance") {
-        if !is_u64(v) {
+        if !is_non_negative_integer(v) {
             issues.push(ValidationIssue {
                 field: format!("steps[{idx}].min_balance"),
-                message: "min_balance must be a non-negative integer".into(),
+                message: "min_balance must be a non-negative integer, or a string of digits".into(),
+                line: None,
+            });
+        }
+    }
+    if let Some(v) = step.params.get("asset") {
+        if !v.is_string() {
+            issues.push(ValidationIssue {
+                field: format!("steps[{idx}].asset"),
+                message: "asset must be a string (e.g. 'native' or 'CODE:ISSUER')".into(),
                 line: None,
             });
         }
@@ -224,6 +233,16 @@ fn require_string(step: &Step, idx: usize, key: &str, issues: &mut Vec<Validatio
 
 fn is_u64(v: &serde_yaml::Value) -> bool {
     v.as_u64().is_some()
+}
+
+/// Accept a non-negative integer as either a YAML integer or a quoted string
+/// of digits. Balances are compared as integers, and a quoted string keeps
+/// large values from being mangled by YAML number parsing.
+fn is_non_negative_integer(v: &serde_yaml::Value) -> bool {
+    if let Some(s) = v.as_str() {
+        return !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    }
+    is_u64(v)
 }
 
 /// Find the 1-based line number of a top-level key in raw YAML text.

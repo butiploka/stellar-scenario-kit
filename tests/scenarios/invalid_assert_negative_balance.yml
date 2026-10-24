@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: assert_negative_balance
+description: Negative min_balance should fail validation.
+network: testnet
+steps:
+  - action: assert_balance
+    identity: preview
+    min_balance: "-5"

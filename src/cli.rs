@@ -37,6 +37,18 @@ pub enum Command {
         output: OutputFormat,
     },
 
+    /// Execute read-only `assert_balance` steps.
+    ///
+    /// Only read-only steps are executed. Any step that would mutate remote
+    /// state (funding, payments) is reported as skipped, never run.
+    Assert {
+        /// Path to a YAML scenario file.
+        file: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        output: OutputFormat,
+    },
+
     /// Report environment readiness.
     ///
     /// Checks whether the Stellar CLI is available and what it reports.

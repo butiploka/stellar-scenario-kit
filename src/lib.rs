@@ -12,6 +12,7 @@
 //! | 1 | Validation failed — the file parsed but broke a schema or semantic rule |
 //! | 2 | I/O error, YAML parse error, or unexpected internal error |
 
+pub mod assert;
 pub mod cli;
 pub mod error;
 pub mod plan;

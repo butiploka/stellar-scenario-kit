@@ -1,0 +1,9 @@
+schema_version: "1.0"
+name: assert_preview_balance
+description: Assert preview identity balance on testnet (read-only).
+network: testnet
+steps:
+  - action: assert_balance
+    identity: preview
+    asset: native
+    min_balance: "0"

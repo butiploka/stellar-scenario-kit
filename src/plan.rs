@@ -168,17 +168,28 @@ fn plan_step(index: usize, step: &Step, scenario: &Scenario, executable: &str) -
                 SideEffect::MutatesRemoteState,
             )
         }
-        "assert_balance" => (
-            vec![
-                "token".to_string(),
-                "balance".to_string(),
-                "--account".to_string(),
-                source.to_string(),
-                "--network".to_string(),
-                scenario.network.clone(),
-            ],
-            SideEffect::ReadOnly,
-        ),
+        "assert_balance" => {
+            let asset = step
+                .params
+                .get("asset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("native");
+            (
+                vec![
+                    "token".to_string(),
+                    "balance".to_string(),
+                    "--id".to_string(),
+                    asset.to_string(),
+                    "--account".to_string(),
+                    source.to_string(),
+                    "--network".to_string(),
+                    scenario.network.clone(),
+                    "--output".to_string(),
+                    "json".to_string(),
+                ],
+                SideEffect::ReadOnly,
+            )
+        }
         other => (vec![other.to_string()], SideEffect::ReadOnly),
     };
 

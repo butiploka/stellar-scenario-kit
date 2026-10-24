@@ -130,8 +130,40 @@ pub fn run(
     run_with_stdin(executable, args, timeout, None)
 }
 
+/// Run a subprocess and return its output regardless of exit status.
+///
+/// Unlike [`run`], a non-zero exit is not an error: the caller gets the exit
+/// code plus both streams so it can interpret them. Use this when the CLI
+/// reports structured errors on stdout with a non-zero exit code.
+pub fn run_capture(
+    executable: &OsStr,
+    args: &[&OsStr],
+    timeout: Duration,
+) -> Result<CommandOutput, RunnerError> {
+    run_with_stdin_capture(executable, args, timeout, None)
+}
+
 /// Run a subprocess, optionally writing `stdin_data` to its standard input.
 pub fn run_with_stdin(
+    executable: &OsStr,
+    args: &[&OsStr],
+    timeout: Duration,
+    stdin_data: Option<String>,
+) -> Result<CommandOutput, RunnerError> {
+    let output = run_with_stdin_capture(executable, args, timeout, stdin_data)?;
+    if output.exit_code == 0 {
+        Ok(output)
+    } else {
+        Err(RunnerError::NonZeroExit {
+            exit_code: output.exit_code,
+            stderr: output.stderr,
+        })
+    }
+}
+
+/// Shared implementation: spawn, drain, enforce the timeout, and return the
+/// raw result without judging the exit code.
+pub fn run_with_stdin_capture(
     executable: &OsStr,
     args: &[&OsStr],
     timeout: Duration,
@@ -203,18 +235,11 @@ pub fn run_with_stdin(
 
     let exit_code = status.code().unwrap_or(-1);
 
-    if exit_code == 0 {
-        Ok(CommandOutput {
-            exit_code,
-            stdout: trim_trailing_newline(&stdout),
-            stderr: trim_trailing_newline(&stderr),
-        })
-    } else {
-        Err(RunnerError::NonZeroExit {
-            exit_code,
-            stderr: trim_trailing_newline(&stderr),
-        })
-    }
+    Ok(CommandOutput {
+        exit_code,
+        stdout: trim_trailing_newline(&stdout),
+        stderr: trim_trailing_newline(&stderr),
+    })
 }
 
 fn read_to_end(pipe: &mut Option<impl Read>) -> Vec<u8> {
