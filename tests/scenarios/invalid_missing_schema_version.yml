@@ -1,0 +1,5 @@
+name: missing_schema_version
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice

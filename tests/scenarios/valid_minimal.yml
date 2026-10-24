@@ -1,0 +1,6 @@
+schema_version: "1.0"
+name: valid_minimal
+network: local
+steps:
+  - action: ensure_funded
+    identity: alice

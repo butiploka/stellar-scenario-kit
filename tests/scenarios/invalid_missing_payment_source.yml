@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: missing_payment_source
+network: testnet
+steps:
+  - action: payment
+    to: bob
+    amount: "100"

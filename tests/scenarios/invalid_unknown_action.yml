@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: unknown_action
+network: testnet
+steps:
+  - action: teleport_funds
+    from: alice
+    to: bob

@@ -1,0 +1,19 @@
+schema_version: "1.0"
+name: valid_payment
+description: Fixture used by integration tests for the validate command.
+network: testnet
+source: alice
+steps:
+  - action: ensure_funded
+    identity: alice
+    min_balance: 200
+
+  - action: payment
+    from: alice
+    to: bob
+    amount: "100"
+    asset: native
+
+  - action: assert_balance
+    identity: bob
+    min_balance: 100

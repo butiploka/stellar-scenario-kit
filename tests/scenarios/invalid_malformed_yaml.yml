@@ -1,0 +1,5 @@
+schema_version: "1.0"
+name: malformed
+network: testnet
+steps:
+  - action: "unclosed quote

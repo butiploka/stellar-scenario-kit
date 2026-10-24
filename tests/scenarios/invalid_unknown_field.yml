@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: unknown_field
+network: testnet
+unexpected_field: true
+steps:
+  - action: ensure_funded
+    identity: alice

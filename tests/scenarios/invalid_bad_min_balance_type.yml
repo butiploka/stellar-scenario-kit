@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: bad_min_balance_type
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+    min_balance: "lots"

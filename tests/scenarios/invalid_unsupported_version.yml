@@ -1,0 +1,6 @@
+schema_version: "2.0"
+name: unsupported_version
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
