@@ -149,9 +149,16 @@ fn plan_never_emits_secret_keys() {
 fn plan_does_not_mutate_remote_state() {
     // The scenario used here would fund and pay if executed. Running `plan`
     // must leave the local Stellar CLI identity list unchanged.
-    let before = stellar_scenario::stellar::StellarCli::discover()
-        .and_then(|c| c.list_identities())
-        .expect("list identities before");
+    //
+    // Requires the Stellar CLI to observe the identity list; skip cleanly on
+    // hosts without it (e.g. a bare CI runner).
+    let Some(before) = stellar_scenario::stellar::StellarCli::discover()
+        .ok()
+        .and_then(|c| c.list_identities().ok())
+    else {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    };
 
     let mut cmd = Command::new(bin());
     cmd.arg("plan").arg(example("payment.yml"));
@@ -181,12 +188,20 @@ fn doctor_emits_structured_json() {
 }
 
 #[test]
-fn doctor_reports_stellar_cli_presence() {
+fn doctor_reports_stellar_cli_check() {
+    // Exit code depends on whether the Stellar CLI is installed on this host
+    // (1 when a check fails), but the check must always be reported.
     let mut cmd = Command::new(bin());
     cmd.arg("doctor");
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("stellar_cli"));
+    let output = cmd.output().expect("run doctor");
+
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(1)),
+        "unexpected exit code {:?}",
+        output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stellar_cli"), "stdout: {stdout}");
 }
 
 #[test]
@@ -212,8 +227,17 @@ fn doctor_never_prints_secret_material() {
 fn doctor_text_output_lists_checks() {
     let mut cmd = Command::new(bin());
     cmd.arg("doctor").arg("--output").arg("text");
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("stellar_cli"));
+    let output = cmd.output().expect("run doctor");
+
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(1)),
+        "unexpected exit code {:?}",
+        output.status.code()
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "text output must not go to stdout"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stellar_cli"), "stderr: {stderr}");
 }
