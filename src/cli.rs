@@ -24,6 +24,28 @@ pub enum Command {
         #[arg(long, value_enum, default_value = "json")]
         output: OutputFormat,
     },
+
+    /// Plan a scenario without running anything.
+    ///
+    /// Prints the exact Stellar CLI commands that would be executed. No
+    /// subprocess is spawned and no network is contacted.
+    Plan {
+        /// Path to a YAML scenario file.
+        file: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        output: OutputFormat,
+    },
+
+    /// Report environment readiness.
+    ///
+    /// Checks whether the Stellar CLI is available and what it reports.
+    /// Never prints secret material.
+    Doctor {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        output: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

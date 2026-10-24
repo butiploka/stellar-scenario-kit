@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: read_only_probe
+description: Only read-only steps; used to test plan side-effect classification.
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: 1

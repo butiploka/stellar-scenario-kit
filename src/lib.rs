@@ -14,8 +14,11 @@
 
 pub mod cli;
 pub mod error;
+pub mod plan;
 pub mod reporter;
+pub mod runner;
 pub mod scenario;
+pub mod stellar;
 
 /// Crate version, taken from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
