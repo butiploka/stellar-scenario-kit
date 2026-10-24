@@ -66,6 +66,64 @@ fn simulate_rejects_non_string_args() {
 }
 
 #[test]
+fn simulate_rejects_non_string_arg_element() {
+    simulate_cmd(&fixture("invalid_simulate_arg_element.yml"))
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("each arg must be a string"));
+}
+
+#[test]
+fn simulate_reports_wrong_arg_type_as_build_failure() {
+    if !stellar_available() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    // The CLI type-checks Soroban arguments against the contract spec. A
+    // number where an Address is expected must surface as a build failure
+    // with the CLI's own message, not be silently coerced.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("wrong_type.yml");
+    std::fs::write(
+        &path,
+        r#"schema_version: "1.0"
+name: wrong_arg_type
+network: testnet
+source: GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: balance
+    args: ["--id", "12345"]
+"#,
+    )
+    .expect("write scenario");
+
+    let output = simulate_cmd(path.to_str().unwrap())
+        .output()
+        .expect("run simulate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = stdout.parse().unwrap();
+    let results = parsed.get("results").unwrap().as_array().unwrap();
+
+    let status = results[0].get("status").and_then(|v| v.as_str()).unwrap();
+    // Either the build fails (type rejected by the CLI) or the network is
+    // unavailable. Both are non-success; the assertion is that a wrong type
+    // never becomes a successful simulation.
+    assert_ne!(
+        status, "simulated",
+        "a wrong argument type must not simulate successfully: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        parsed.get("submitted").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
+
+#[test]
 fn simulate_accepts_valid_scenario() {
     // Validation must accept `simulate_invoke`. Whether the live simulation
     // succeeds depends on network availability, so this only asserts that
@@ -146,6 +204,89 @@ fn simulate_never_invokes_submission() {
         "no step should be executed: {results:?}"
     );
     assert_eq!(parsed.get("skipped").and_then(|v| v.as_u64()), Some(2));
+}
+
+#[test]
+fn simulate_never_invokes_submission_or_funding_commands() {
+    if !stellar_available() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    // A fake `stellar` on PATH records every argv it is given, then exits 0
+    // with empty output. Any attempt to run `tx send`, `keys fund`,
+    // `keys generate`, or `contract deploy` would be captured here.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("argv.log");
+    let fake = dir.path().join("stellar");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            log.display()
+        ),
+    )
+    .expect("write fake stellar");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).expect("stat fake").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).expect("chmod");
+    }
+
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: argv_probe
+network: testnet
+source: GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26
+timeout_seconds: 30
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: decimals
+  - action: ensure_funded
+    identity: GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("simulate")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap());
+    let output = cmd.output().expect("run simulate");
+
+    let argv_log = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = argv_log.lines().collect();
+
+    assert!(!lines.is_empty(), "fake stellar was never invoked");
+    for line in &lines {
+        assert!(
+            !line.contains("tx send"),
+            "submission command invoked: {line}"
+        );
+        assert!(
+            !line.contains("keys fund") && !line.contains("keys generate"),
+            "funding or key generation invoked: {line}"
+        );
+        assert!(
+            !line.contains("contract deploy"),
+            "contract deployment invoked: {line}"
+        );
+    }
+
+    // The mutating step must be skipped, so only the simulate_invoke step
+    // should have produced any subprocess calls.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = stdout.parse().unwrap();
+    assert_eq!(parsed.get("skipped").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        parsed.get("submitted").and_then(|v| v.as_bool()),
+        Some(false)
+    );
 }
 
 #[test]

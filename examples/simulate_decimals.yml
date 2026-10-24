@@ -1,0 +1,10 @@
+schema_version: "1.0"
+name: simulate_decimals_zero_args
+description: "Second verified signature: decimals() takes no arguments and returns a u32."
+network: testnet
+source: GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26
+timeout_seconds: 60
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: decimals

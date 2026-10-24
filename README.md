@@ -213,6 +213,7 @@ stellar-scenario simulate examples/simulate_invoke.yml
       "envelope_sha256": "b7775547cb49791cf3d64c1823f9f0999086e8823d7c2a20871885ba044112b6",
       "resources": {
         "fee": "7266",
+        "resource_fee": "7166",
         "instructions": 141406
       },
       "diagnostic": "envelope simulated; not submitted"
@@ -520,18 +521,61 @@ Aggregation rules:
 A skipped step is never counted as a pass. An error is never counted as a
 pass.
 
+Simulation report (`simulate` command):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `scenario` | string | Scenario name |
+| `schema_version` | string | Version declared by the scenario file |
+| `network` | string | Network profile the run targeted |
+| `total_steps` | integer | Total steps declared in the scenario |
+| `simulated` | integer | Steps that produced a simulated envelope |
+| `unsupported` | integer | Steps refused as unsupported operation types |
+| `failed` | integer | Steps that failed for another reason |
+| `skipped` | integer | Steps not executed (mutating or non-simulation) |
+| `status` | string | `"simulated"`, `"unsupported_operation"`, `"failed"`, or `"no_simulations"` |
+| `submitted` | boolean | Always `false` |
+| `results` | array | Per-step results, in step order |
+
+Each entry in `results` has `scenario`, `step_index`, `action`, `network`,
+`source`, `contract_id`, `function`, `simulated` (always `true`), `submitted`
+(always `false`), `status`, `envelope_sha256` (string or null), `resources`,
+and `diagnostic`.
+
+`envelope_sha256` is the SHA-256 of the base64 string returned by
+`stellar tx simulate` — a content fingerprint of the *encoded* envelope, not a
+hash of the decoded XDR bytes. It is not a ledger identifier and is not
+comparable to a transaction hash from the network.
+
+`resources` holds `fee`, `resource_fee`, and `instructions` decoded from the
+simulated envelope. `resource_fee` is read from `ext.v1.resource_fee`, a
+sibling of `ext.v1.resources` in the decoded envelope — not from inside
+`resources`.
+
+Aggregation rules:
+- `failed` wins over everything (at least one failure → `failed`)
+- then `unsupported_operation` (at least one unsupported, no failures)
+- then `simulated` (at least one simulated, no failures or unsupported)
+- otherwise `no_simulations`
+
 ## Examples
 
 - `examples/payment.yml` — fund, pay, assert balance
 - `examples/auth_setup.yml` — fund an identity for authorization testing
 - `examples/assert_balance.yml` — read-only balance assertion
 - `examples/assert_asset.yml` — existence-only asset assertion
+- `examples/simulate_invoke.yml` — simulate `balance(id)` on the native SAC
+- `examples/simulate_decimals.yml` — simulate `decimals()` (zero args, u32)
+- `examples/simulate_allowance.yml` — simulate `allowance(from, spender)` (two Address args)
 
 ```bash
 stellar-scenario validate examples/payment.yml
 stellar-scenario plan examples/payment.yml
 stellar-scenario assert examples/assert_balance.yml
 stellar-scenario assert examples/assert_asset.yml
+stellar-scenario simulate examples/simulate_invoke.yml
+stellar-scenario simulate examples/simulate_decimals.yml
+stellar-scenario simulate examples/simulate_allowance.yml
 ```
 
 ## Development
@@ -631,6 +675,38 @@ Live investigation performed on this host (read-only, no state changed):
   **not** necessarily stroops. A token with `decimals: 6` reports millionths,
   not ten-millionths. The parser does not assume any particular `decimals`
   value and never converts.
+
+### Verified simulation signatures
+
+Live-verified against the native Stellar Asset Contract
+(`CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`) on testnet,
+using a pre-existing funded account. All three were built with
+`--build-only`, simulated with `stellar tx simulate`, and decoded with
+`stellar tx decode`. Nothing was submitted.
+
+| Function | Arguments | Return | fee | resource_fee | instructions |
+|----------|-----------|--------|-----|--------------|--------------|
+| `balance` | one `Address` | `i128` | 7266 | 7166 | 141406 |
+| `decimals` | none | `u32` | 6226 | 6126 | 109125 |
+| `allowance` | two `Address` | `i128` | 6923 | 6823 | 167318 |
+
+These three cover the argument shapes the `args` field can express today:
+zero arguments, and one or more `--flag value` string pairs. The contract
+interface was read with `stellar contract info interface`, which lists the
+full SEP-41 surface including `approve`, `burn`, `mint`, `transfer`, and
+`clawback` — all of which mutate state and are therefore out of scope.
+
+Argument type errors are surfaced, not coerced. Passing a number where an
+`Address` is expected fails at envelope build:
+
+```
+❌ error: Failed to parse argument 'id': invalid type: number, expected string or map
+Context: Expected type address (G... for account, C... for contract, or identity name), but received: '12345'
+```
+
+That case is reported as `status: "build_failed"` with exit code 2. An
+unknown function name fails at build with `unrecognized subcommand`, also
+`build_failed`.
 
 ## Minimum Supported Rust Version
 

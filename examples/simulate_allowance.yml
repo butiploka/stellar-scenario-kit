@@ -1,0 +1,15 @@
+schema_version: "1.0"
+name: simulate_allowance_two_args
+description: "Third verified signature: allowance(from, spender) takes two Address arguments."
+network: testnet
+source: GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26
+timeout_seconds: 60
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: allowance
+    args:
+      - "--from"
+      - "GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26"
+      - "--spender"
+      - "GDIPVO6M4SADGLNFTIMYHCTMMOXNONMV4ORZOMP6OAP2DPPYRQBMAW26"

@@ -109,7 +109,12 @@ pub struct SimulationResult {
     pub submitted: bool,
     /// Outcome.
     pub status: SimulationStatus,
-    /// SHA-256 of the simulated envelope, for identifying what was simulated.
+    /// SHA-256 of the base64 string returned by `stellar tx simulate`.
+    ///
+    /// This is a content fingerprint of the *encoded* envelope, not a hash of
+    /// the decoded XDR bytes. It exists so a report can be tied to the exact
+    /// simulated envelope; it is not a ledger identifier and is not comparable
+    /// to a transaction hash from the network.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope_sha256: Option<String>,
     /// Resources decoded from the simulated envelope.
@@ -295,12 +300,10 @@ fn parse_decoded_resources(json: &str) -> SimulatedResources {
         .and_then(|t| t.get("fee"))
         .and_then(|f| f.as_u64())
         .map(|f| f.to_string());
-    let resources = tx
-        .and_then(|t| t.get("ext"))
-        .and_then(|e| e.get("v1"))
-        .and_then(|e| e.get("resources"));
-    let resource_fee = resources
-        .and_then(|r| r.get("resource_fee"))
+    let ext_v1 = tx.and_then(|t| t.get("ext")).and_then(|e| e.get("v1"));
+    let resources = ext_v1.and_then(|e| e.get("resources"));
+    let resource_fee = ext_v1
+        .and_then(|e| e.get("resource_fee"))
         .and_then(|f| f.as_str())
         .map(String::from);
     let instructions = resources
@@ -336,7 +339,8 @@ fn redact(text: &str) -> String {
 /// Minimal SHA-256, used only to give the simulated envelope a stable id.
 ///
 /// This is a compact, self-contained implementation so the crate needs no
-/// hashing dependency. It is not used for any security decision.
+/// hashing dependency. It is not used for any security decision. The input is
+/// the base64 envelope string as returned by the CLI, not decoded XDR bytes.
 fn sha256_hex(input: &str) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -589,7 +593,9 @@ mod tests {
 
     #[test]
     fn parse_decoded_resources_reads_fee_and_resources() {
-        let json = r#"{"tx":{"tx":{"fee":7266,"ext":{"v1":{"resources":{"instructions":141406,"resource_fee":"7166"}}}}}}"#;
+        // Shape taken from a real `stellar tx decode` output: resource_fee is
+        // a sibling of `resources` under `ext.v1`, not a child of it.
+        let json = r#"{"tx":{"tx":{"fee":7266,"ext":{"v1":{"resources":{"instructions":141406},"resource_fee":"7166"}}}}}"#;
         let r = parse_decoded_resources(json);
         assert_eq!(r.fee.as_deref(), Some("7266"));
         assert_eq!(r.resource_fee.as_deref(), Some("7166"));
