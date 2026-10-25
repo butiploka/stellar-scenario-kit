@@ -17,7 +17,7 @@ Everything runs locally.
 Implemented:
 
 - `stellar-scenario validate` — parse and validate a scenario file
-- `stellar-scenario plan` — print the exact Stellar CLI commands a run would
+- `stellar-scenario plan` — print the first Stellar CLI command each step would
   execute, without executing anything
 - `stellar-scenario assert` — execute read-only `assert_balance` and
   `assert_asset` steps, with a structured aggregate report
@@ -191,7 +191,10 @@ stellar-scenario plan examples/payment.yml
 
 `plan` spawns no subprocess and contacts no network. It is a pure function of
 the scenario file plus the resolved CLI path, so it is safe to run anywhere,
-including CI.
+including CI. For `simulate_invoke` steps it prints only the first subcommand
+(`contract invoke --build-only`); the follow-up `tx simulate` and `tx decode`
+calls are not listed. See [simulate_invoke semantics](#simulate_invoke-semantics)
+for the full set of read-only subprocesses a simulation actually performs.
 
 ### Assert balances or asset existence
 

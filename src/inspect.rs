@@ -154,12 +154,16 @@ impl InspectResult {
                 .unwrap_or_else(|| "<no output>".to_string());
             // Classify the CLI's own text, not the wrapper that adds the exit
             // code, so the `starts_with` anchors still match.
-            let diag = crate::diagnostic::Diagnostic::classify(&detail);
+            // The CLI may emit progress chatter (e.g. "ℹ️ Network: ...") before
+            // the actual error line. Extract the line that carries the error
+            // for classification, while preserving the full detail in the diagnostic.
+            let error_text = cli_error_line(&detail);
+            let diag = crate::diagnostic::Diagnostic::classify(&error_text);
             return base.with(
                 InspectStatus::FetchFailed,
                 format!(
-                    "stellar CLI exited with code {}: {detail}",
-                    output.exit_code
+                    "stellar CLI exited with code {}: {}",
+                    output.exit_code, detail
                 ),
                 Some(diag),
             );
@@ -220,6 +224,34 @@ impl InspectResult {
         }
         self
     }
+}
+
+/// The line in CLI output that carries the actual error, if one is present.
+///
+/// `stellar contract info interface` writes progress chatter to stderr before
+/// failing, e.g.
+///
+/// ```text
+/// ℹ️ Network: Test SDF Network ; September 2015
+/// ❌ error: contract not found: CCCC...
+/// ```
+///
+/// The classifier's matchers anchor on the error prefix at the *start* of the
+/// text, so passing the whole stderr makes a recognizable failure classify as
+/// `unknown`. This selects the error line instead.
+///
+/// Only a line that actually begins with the CLI's error prefix is selected —
+/// the last such line, because the CLI prints the fatal error last. Taking an
+/// arbitrary final line would risk classifying unrelated trailing text. When no
+/// error line is present the whole text is returned, so an unrecognized failure
+/// still keeps its original message and stays `unknown`.
+fn cli_error_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("❌ error:") || line.starts_with("error:"))
+        .unwrap_or_else(|| text.trim())
+        .to_string()
 }
 
 /// Render a Soroban spec type.
@@ -798,5 +830,111 @@ steps:
         let json = rep.to_json();
         assert!(json.contains("\"status\": \"inspected\""));
         assert!(json.contains("\"inspected\": 1"));
+    }
+
+    // ---- Error-line selection -------------------------------------------
+    //
+    // `stellar contract info interface` writes a network-progress line to
+    // stderr before the error. The classifier anchors on the error prefix at
+    // the *start* of the text, so passing the whole stderr through turns a
+    // recognizable failure into `unknown`. These tests pin the selection.
+
+    #[test]
+    fn error_line_is_selected_from_multiline_progress_output() {
+        let stderr = "ℹ️ Network: Test SDF Network ; September 2015\n\
+                      ❌ error: contract not found: CCCC\n";
+        assert_eq!(cli_error_line(stderr), "❌ error: contract not found: CCCC");
+    }
+
+    #[test]
+    fn multiline_progress_output_classifies_as_contract_not_found() {
+        let stderr = "ℹ️ Network: Test SDF Network ; September 2015\n\
+                      ❌ error: contract not found: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let d = crate::diagnostic::Diagnostic::classify(&cli_error_line(stderr));
+        assert_eq!(
+            d.category,
+            crate::diagnostic::DiagnosticCategory::ContractNotFound
+        );
+        assert!(d.remediation.contains("contract info interface"));
+        // The unfixed form is what the bug produced. Asserting it here means
+        // this test fails if the selection is ever removed.
+        assert_eq!(
+            crate::diagnostic::Diagnostic::classify(stderr).category,
+            crate::diagnostic::DiagnosticCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn a_trailing_non_error_line_is_not_selected() {
+        // Only a line carrying the error prefix may be chosen; a trailing
+        // informational line must not become the classification input.
+        let stderr = "❌ error: contract not found: CCCC\n\
+                      see https://example.invalid/help\n";
+        assert_eq!(cli_error_line(stderr), "❌ error: contract not found: CCCC");
+    }
+
+    #[test]
+    fn the_last_error_line_wins() {
+        // The CLI prints the fatal error last; an earlier error line is not
+        // the cause of the non-zero exit.
+        let stderr = "error: could not read config\n\
+                      ℹ️ Network: Test SDF Network ; September 2015\n\
+                      ❌ error: contract not found: CCCC";
+        assert_eq!(cli_error_line(stderr), "❌ error: contract not found: CCCC");
+    }
+
+    #[test]
+    fn a_bare_error_prefix_is_also_recognized() {
+        let stderr = "ℹ️ Network: Test SDF Network ; September 2015\n\
+                      error: unrecognized subcommand 'nosuchfn'";
+        let d = crate::diagnostic::Diagnostic::classify(&cli_error_line(stderr));
+        assert_eq!(
+            d.category,
+            crate::diagnostic::DiagnosticCategory::FunctionNotFound
+        );
+    }
+
+    #[test]
+    fn text_without_an_error_line_is_preserved_and_stays_unknown() {
+        // No recognized prefix: the original text is kept, so an unknown
+        // failure is still reported with its own message rather than guessed.
+        let text = "ℹ️ Network: Test SDF Network ; September 2015\nsomething went wrong";
+        assert_eq!(cli_error_line(text), text.trim());
+        assert_eq!(
+            crate::diagnostic::Diagnostic::classify(&cli_error_line(text)).category,
+            crate::diagnostic::DiagnosticCategory::Unknown
+        );
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        assert_eq!(cli_error_line(""), "");
+    }
+
+    #[test]
+    fn inspect_diagnostic_redacts_secret_seeds() {
+        // `with()` sanitizes whatever text it is handed, including a seed the
+        // CLI might echo into its error line.
+        let seed = "S".to_string() + &"A".repeat(55);
+        let r = InspectResult {
+            contract_id: "CABC".into(),
+            network: "testnet".into(),
+            status: InspectStatus::Error,
+            interface: None,
+            diagnostic: String::new(),
+            diagnostic_category: None,
+            remediation: None,
+        }
+        .with(
+            InspectStatus::FetchFailed,
+            format!("stellar CLI exited with code 1: {seed}"),
+            None,
+        );
+        assert!(
+            !r.diagnostic.contains(&seed),
+            "seed survived redaction: {}",
+            r.diagnostic
+        );
+        assert!(r.diagnostic.contains("<redacted-secret>"));
     }
 }
