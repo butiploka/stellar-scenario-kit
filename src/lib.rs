@@ -18,6 +18,7 @@ pub mod inspect;
 pub mod plan;
 pub mod reporter;
 pub mod runner;
+pub mod scaffold;
 pub mod scenario;
 pub mod simulate;
 pub mod stellar;

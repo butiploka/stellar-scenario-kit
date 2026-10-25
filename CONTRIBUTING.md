@@ -62,12 +62,16 @@ src/
   stellar.rs      Stellar CLI discovery and read-only diagnostics
   assert.rs       balance/asset assertion model, execution, and reporting
   simulate.rs     transaction simulation model, execution, and reporting
+  inspect.rs      contract interface parsing and reporting
+  scaffold.rs     generate a simulate_invoke step from an interface
 tests/
   unit_tests.rs            parsing and validation unit tests
   integration_test.rs      validate command tests
   execution_test.rs        plan and doctor command tests
   assert_test.rs           assert command tests
   simulate_test.rs         simulate command tests
+  inspect_test.rs          inspect command tests
+  scaffold_test.rs         scaffold command tests
   json_contract_test.rs    JSON shape, status vocabulary, exit-code contract
   robustness_test.rs       subprocess failure modes via a fake CLI
   scenarios/               checked-in fixtures

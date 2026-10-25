@@ -12,6 +12,7 @@ use stellar_scenario::inspect::{InspectReport, InspectReportStatus, InspectResul
 use stellar_scenario::plan::{ExecutionPlan, SideEffect};
 use stellar_scenario::reporter::ValidationReport;
 use stellar_scenario::runner::find_stellar_cli;
+use stellar_scenario::scaffold::{ScaffoldResult, ScaffoldStatus};
 use stellar_scenario::scenario::Scenario;
 use stellar_scenario::simulate::{SimulationReport, SimulationReportStatus, SimulationResult};
 use stellar_scenario::stellar;
@@ -25,6 +26,12 @@ fn main() -> ExitCode {
         Command::Assert { file, output } => run_assert(&file, output),
         Command::Simulate { file, output } => run_simulate(&file, output),
         Command::Inspect { file, output } => run_inspect(&file, output),
+        Command::Scaffold {
+            file,
+            contract_id,
+            function,
+            output,
+        } => run_scaffold(&file, contract_id.as_deref(), function, output),
         Command::Doctor { output } => run_doctor(output),
     }
 }
@@ -215,6 +222,147 @@ fn run_inspect(file: &Path, output: OutputFormat) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+    }
+}
+
+/// Pick the single contract a scenario inspects.
+///
+/// Returns the contract id, or an actionable message when the scenario has
+/// no inspect step, none matching `--contract-id`, or more than one.
+fn select_contract(
+    scenario: &Scenario,
+    file: &Path,
+    contract_id: Option<&str>,
+) -> Result<String, String> {
+    let mut ids: Vec<String> = scenario
+        .steps
+        .iter()
+        .filter(|s| s.action == "inspect_contract")
+        .filter_map(|s| s.params.get("contract_id").and_then(|v| v.as_str()))
+        .map(String::from)
+        .collect();
+
+    if let Some(filter) = contract_id {
+        ids.retain(|id| id == filter);
+        if ids.is_empty() {
+            return Err(format!(
+                "no inspect_contract step matches --contract-id {filter}; add one to {}",
+                file.display()
+            ));
+        }
+    }
+
+    ids.dedup();
+    match ids.len() {
+        0 => Err(format!(
+            "{} has no inspect_contract step; add one to select a contract",
+            file.display()
+        )),
+        1 => Ok(ids.remove(0)),
+        _ => Err(format!(
+            "{} inspects {} contracts; pass --contract-id to pick one: {}",
+            file.display(),
+            ids.len(),
+            ids.join(", ")
+        )),
+    }
+}
+
+fn run_scaffold(
+    file: &Path,
+    contract_id: Option<&str>,
+    function: String,
+    output: OutputFormat,
+) -> ExitCode {
+    let scenario = match Scenario::from_file(file) {
+        Ok(s) => s,
+        Err(e) => {
+            let report = ValidationReport::invalid(file, &e);
+            match output {
+                OutputFormat::Json => println!("{}", report.to_json()),
+                OutputFormat::Text => eprintln!("{}", report.to_text()),
+            }
+            return ExitCode::from(e.exit_code() as u8);
+        }
+    };
+
+    // The scenario is the primary input, so its shape is checked before the
+    // CLI is touched. Otherwise a scenario with no inspect step would be
+    // reported as "stellar CLI unavailable" on a host without the CLI,
+    // hiding the actual problem.
+    let selected = match select_contract(&scenario, file, contract_id) {
+        Ok(id) => id,
+        Err(msg) => {
+            let status = if contract_id.is_some() {
+                "no_contract_in_scenario"
+            } else if scenario
+                .steps
+                .iter()
+                .any(|s| s.action == "inspect_contract")
+            {
+                "ambiguous_contract"
+            } else {
+                "no_contract_in_scenario"
+            };
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::json!({
+                        "scenario": scenario.name,
+                        "schema_version": scenario.schema_version,
+                        "network": scenario.network,
+                        "status": status,
+                        "diagnostic": msg,
+                        "args": [],
+                    })
+                ),
+                OutputFormat::Text => eprintln!("error: {msg}"),
+            }
+            return ExitCode::from(1);
+        }
+    };
+
+    let executable = match find_stellar_cli(None) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("stellar CLI unavailable: {e}");
+            match output {
+                OutputFormat::Json => println!("{{\"error\":\"{msg}\"}}"),
+                OutputFormat::Text => eprintln!("error: {msg}"),
+            }
+            return ExitCode::from(2);
+        }
+    };
+
+    let result = ScaffoldResult::execute(&scenario, file, Some(&selected), &function, &executable);
+
+    match output {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        OutputFormat::Text => {
+            // The YAML is the payload, so it goes to stdout; the diagnostic
+            // goes to stderr. That keeps `scaffold ... > step.yml` clean.
+            if let Some(yaml) = &result.yaml {
+                print!("{yaml}");
+            }
+            eprintln!("{}: {}", result.function, result.diagnostic);
+        }
+    }
+
+    match result.status {
+        ScaffoldStatus::Generated => ExitCode::SUCCESS,
+        // The request was well-formed but the contract does not offer it.
+        ScaffoldStatus::FunctionNotFound | ScaffoldStatus::UnsupportedType => ExitCode::from(1),
+        // Ambiguity or a missing selection is a usage problem.
+        ScaffoldStatus::NoContractInScenario | ScaffoldStatus::AmbiguousContract => {
+            ExitCode::from(1)
+        }
+        // The interface could not be obtained.
+        ScaffoldStatus::InspectFailed | ScaffoldStatus::Error => ExitCode::from(2),
     }
 }
 

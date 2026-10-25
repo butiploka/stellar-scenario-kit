@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: inspect_two_contracts
+network: testnet
+steps:
+  - action: inspect_contract
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+  - action: inspect_contract
+    contract_id: CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA

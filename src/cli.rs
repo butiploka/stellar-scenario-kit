@@ -76,6 +76,26 @@ pub enum Command {
         output: OutputFormat,
     },
 
+    /// Generate a `simulate_invoke` step from a contract interface.
+    ///
+    /// Reads the contract inspected by the scenario, picks one function,
+    /// and prints a YAML step with placeholder arguments. Read-only; no
+    /// transaction is built or submitted.
+    Scaffold {
+        /// Path to a YAML scenario file that contains an `inspect_contract`
+        /// step.
+        file: PathBuf,
+        /// Contract id to scaffold for. Required when the scenario inspects
+        /// more than one contract.
+        #[arg(long)]
+        contract_id: Option<String>,
+        /// Function name to scaffold.
+        function: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        output: OutputFormat,
+    },
+
     /// Report environment readiness.
     ///
     /// Checks whether the Stellar CLI is available and what it reports.
