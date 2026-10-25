@@ -723,8 +723,8 @@ green on a bare host.
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace`
 4. `cargo test --workspace` again with `STELLAR_CLI` pointing at a
-   nonexistent path and a minimal `PATH`, which is the state a contributor
-   without the Stellar CLI will hit
+   nonexistent path, which is the state a contributor without the Stellar
+   CLI will hit
 5. `cargo check --workspace --all-targets` on Rust 1.85.0, pinning the MSRV
 
 The Stellar CLI is not installed on the runner, so tests that need it skip.

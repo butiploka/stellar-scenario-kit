@@ -46,7 +46,6 @@ jobs:
         run: cargo test --workspace
         env:
           STELLAR_CLI: /nonexistent/stellar
-          PATH: /usr/local/bin:/usr/bin:/bin
 
   # Pins the declared MSRV. A dependency bump that silently raises the real
   # minimum will fail here rather than in a user's build.
