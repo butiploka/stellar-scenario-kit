@@ -36,6 +36,24 @@ fn stellar_available() -> bool {
     stellar_scenario::runner::find_stellar_cli(None).is_ok()
 }
 
+/// True when the resolved CLI can actually run.
+///
+/// `find_stellar_cli` returns `Ok` for any explicit `STELLAR_CLI` path,
+/// including one that does not exist. A test that only checks `is_ok()` then
+/// runs a real query and gets a spawn failure it did not expect. Probing with
+/// `--version` catches that.
+fn stellar_runnable() -> bool {
+    match stellar_scenario::runner::find_stellar_cli(None) {
+        Ok(path) => stellar_scenario::runner::run(
+            path.as_os_str(),
+            &[std::ffi::OsStr::new("--version")],
+            std::time::Duration::from_secs(10),
+        )
+        .is_ok(),
+        Err(_) => false,
+    }
+}
+
 // ------------------------------------------------------- offline behaviour
 
 #[test]
@@ -291,7 +309,7 @@ steps:
 
 #[test]
 fn simulate_result_never_contains_secret_material() {
-    if !stellar_available() {
+    if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
     }
@@ -315,7 +333,7 @@ fn simulate_result_never_contains_secret_material() {
 
 #[test]
 fn simulate_text_output_goes_to_stderr() {
-    if !stellar_available() {
+    if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
     }
@@ -336,7 +354,7 @@ const NATIVE_SAC_TESTNET: &str = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQ
 
 #[test]
 fn simulate_live_native_sac_read() {
-    if !stellar_available() {
+    if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
     }
@@ -392,7 +410,7 @@ steps:
 
 #[test]
 fn simulate_live_missing_contract_fails() {
-    if !stellar_available() {
+    if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
     }

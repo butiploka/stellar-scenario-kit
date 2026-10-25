@@ -246,9 +246,29 @@ fn stellar_available() -> bool {
     stellar_scenario::runner::find_stellar_cli(None).is_ok()
 }
 
+/// True when the resolved CLI can actually run.
+///
+/// `find_stellar_cli` returns `Ok` for any explicit `STELLAR_CLI` path,
+/// including one that does not exist. A test that only checks `is_ok()` then
+/// runs a real query and gets a spawn failure it did not expect. Probing with
+/// `--version` catches that.
+fn stellar_runnable() -> bool {
+    match stellar_scenario::runner::find_stellar_cli(None) {
+        Ok(path) => {
+            let out = stellar_scenario::runner::run(
+                path.as_os_str(),
+                &[std::ffi::OsStr::new("--version")],
+                std::time::Duration::from_secs(10),
+            );
+            out.is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 #[test]
 fn assert_against_funded_account_passes() {
-    if !stellar_available() {
+    if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
     }
@@ -293,7 +313,7 @@ steps:
 
 #[test]
 fn assert_against_funded_account_fails_when_too_high() {
-    if !stellar_available() {
+    if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");
         return;
     }

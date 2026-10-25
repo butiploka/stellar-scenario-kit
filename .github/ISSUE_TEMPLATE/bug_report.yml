@@ -1,0 +1,32 @@
+name: Bug report
+description: Something is not working as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Command you ran**
+
+        ```bash
+        stellar-scenario <subcommand> <file> --output <format>
+        ```
+
+        **Scenario file**
+
+        ```yaml
+        # paste here, redacting anything sensitive
+        ```
+
+        **What happened**
+
+        Paste the JSON output or error text.
+
+        **What you expected**
+
+        What should have happened instead.
+
+        **Environment**
+
+        - `stellar --version`:
+        - `cargo --version`:
+        - OS:

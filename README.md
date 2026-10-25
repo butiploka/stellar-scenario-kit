@@ -42,20 +42,31 @@ Not yet implemented (deferred deliberately):
 
 ## Installation
 
-Requires Rust 1.80.0 or newer.
+Requires Rust 1.85.0 or newer.
+
+From crates.io (once published):
 
 ```bash
-cargo install --path .
+cargo install stellar-scenario
 ```
 
-Or build from source:
+From source:
 
 ```bash
 git clone https://github.com/butiploka/stellar-scenario-kit.git
 cd stellar-scenario-kit
+cargo install --path .
+```
+
+Or build without installing:
+
+```bash
 cargo build --release
 # binary at target/release/stellar-scenario
 ```
+
+The MSRV is enforced by a CI job at exactly 1.85.0, so a dependency bump that
+raises the real minimum fails there rather than in your build.
 
 ### Prerequisites
 
@@ -711,6 +722,14 @@ green on a bare host.
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace`
+4. `cargo test --workspace` again with `STELLAR_CLI` pointing at a
+   nonexistent path and a minimal `PATH`, which is the state a contributor
+   without the Stellar CLI will hit
+5. `cargo check --workspace --all-targets` on Rust 1.85.0, pinning the MSRV
+
+The Stellar CLI is not installed on the runner, so tests that need it skip.
+That is why step 4 exists: it proves the suite is green in that state rather
+than assuming it.
 
 ## Known limitations
 
@@ -789,10 +808,24 @@ unknown function name fails at build with `unrecognized subcommand`, also
 
 ## Minimum Supported Rust Version
 
-1.80.0. The direct dependencies (`clap` 4.5, `serde` 1.0, `serde_yaml` 0.9,
-`serde_json` 1.0, `thiserror` 1.0) all support older versions; 1.80.0 is the
-floor chosen for this project and is enforced via `rust-version` in
-`Cargo.toml`.
+**1.85.0**, verified by building and running the full test suite on that
+toolchain, and enforced by a CI job pinned to it.
+
+The floor is set by the resolved dependency graph, not by the direct
+dependencies' own minimums. `clap_lex` 1.1.1 (a transitive dependency of
+`clap` 4.6) requires the `edition2024` Cargo feature, which is not
+stabilized before 1.85.0. An earlier claim of 1.80.0 was wrong: that
+toolchain cannot even parse the lockfile.
+
+`rust-version` in `Cargo.toml` is set to the tested value. If a future
+dependency bump raises the real minimum, the MSRV CI job fails rather than
+users discovering it in their own build.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build steps, the exit-code
+contract, what is deliberately out of scope, and how to add a fixture or a
+command.
 
 ## License
 

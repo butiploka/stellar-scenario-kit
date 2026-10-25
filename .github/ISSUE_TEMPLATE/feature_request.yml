@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a capability that is not in the current scope
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **What you want to do**
+
+        Describe the task, not the implementation.
+
+        **Why the current actions cannot do it**
+
+        Which of `assert_balance`, `assert_asset`, or `simulate_invoke` falls short, and how.
+
+        **Scope check**
+
+        This project does not implement transaction submission or ledger mutation. If your request needs either, say so explicitly so it can be discussed rather than silently declined.
+
+        **Alternatives considered**
+
+        Anything you tried instead.
