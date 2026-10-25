@@ -373,3 +373,114 @@ fn inspect_live_native_sac() {
 
     assert_eq!(output.status.code(), Some(0));
 }
+
+// ------------------------------------------------ diagnostic classification tests
+
+#[test]
+fn fetch_failed_contract_not_found_classified() {
+    // The CLI's own text names the cause; the classifier reads it.
+    let r = inspect_with_fake("", "1", "❌ error: contract not found: CEEE");
+    let res = first(&r);
+    assert_eq!(res["status"], "fetch_failed");
+    assert_eq!(res["diagnostic_category"], "contract_not_found");
+    assert!(
+        res["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("contract info interface"),
+        "res: {res}"
+    );
+}
+
+#[test]
+fn fetch_failed_network_not_configured_classified() {
+    let r = inspect_with_fake(
+        "",
+        "1",
+        "❌ error: Failed to find config network for nosuchnet",
+    );
+    let res = first(&r);
+    assert_eq!(res["status"], "fetch_failed");
+    assert_eq!(res["diagnostic_category"], "network_not_configured");
+    assert!(
+        res["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("network add"),
+        "res: {res}"
+    );
+}
+
+#[test]
+fn fetch_failed_unknown_is_unknown() {
+    // An unrecognized message must not be forced into a category.
+    let r = inspect_with_fake("", "1", "some failure this build does not know");
+    let res = first(&r);
+    assert_eq!(res["status"], "fetch_failed");
+    assert_eq!(res["diagnostic_category"], "unknown");
+}
+
+#[test]
+fn inspected_success_has_no_category() {
+    // Success must not carry a category or remediation.
+    let r = inspect_with_fake(GOOD_SPEC, "0", "");
+    let res = first(&r);
+    assert_eq!(res["status"], "inspected");
+    assert!(
+        res.get("diagnostic_category").is_none(),
+        "success must not carry a category: {res}"
+    );
+    assert!(
+        res.get("remediation").is_none(),
+        "success must not carry a remediation: {res}"
+    );
+}
+
+#[test]
+fn parse_failed_has_no_category() {
+    // Parse failures already have a distinct status; no category is added,
+    // because no existing category describes "output was not the spec shape".
+    let r = inspect_with_fake("", "0", "");
+    let res = first(&r);
+    assert_eq!(res["status"], "parse_failed");
+    assert!(
+        res.get("diagnostic_category").is_none(),
+        "parse_failed must not carry a category: {res}"
+    );
+}
+
+#[test]
+fn cli_error_missing_cli_classified_as_unknown() {
+    // When the CLI binary itself cannot be found, classify_runner maps it to
+    // Unknown (its type is SpawnFailed/NotFound, not a message the classifier
+    // knows how to parse).
+    let mut cmd = Command::new(bin());
+    cmd.arg("inspect")
+        .arg(fixture("valid_inspect_contract.yml"))
+        .env("STELLAR_CLI", "/tmp/stellar-scenario-absent-binary-xyz");
+    let output = cmd.output().expect("run inspect");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().expect("valid JSON");
+    let res = &v["results"][0];
+    assert_eq!(res["status"], "error");
+    assert_eq!(res["diagnostic_category"], "unknown");
+    // The human-readable diagnostic is preserved, but redacted if it contains
+    // secrets (which it shouldn't in this case, but the test proves the path
+    // flows correctly).
+    assert!(
+        res["diagnostic"].as_str().unwrap().contains("error"),
+        "res: {res}"
+    );
+}
+
+#[test]
+fn fetch_failed_seed_is_redacted() {
+    // A seed in the CLI's error text must not reach JSON, while the category
+    // is still derived from the same text.
+    let seed = format!("S{}", "A".repeat(55));
+    let r = inspect_with_fake("", "1", &format!("failed for (key {seed})"));
+    let res = first(&r);
+    let diag = res["diagnostic"].as_str().unwrap();
+    assert!(!diag.contains(&seed), "seed leaked: {diag}");
+    assert!(diag.contains("<redacted-secret>"), "diag: {diag}");
+}

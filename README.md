@@ -624,6 +624,26 @@ with its original message intact — that is the intended behavior, not a gap to
 be closed by loosening the matchers. Adding a category requires reproducing
 the error first; a plausible-looking string match is not evidence.
 
+### Inspect diagnostics
+
+The `inspect` command reports the same `diagnostic_category` and `remediation`
+fields on failed inspection results. The category list is the same set as
+[simulation diagnostics](#simulate-diagnostics-and-remediation).
+
+Inspect classifies failures differently than simulation or assertion:
+
+- A **non-zero exit** is classified from the CLI's raw stderr/stdout, before
+  the exit-code prefix is added. Wrapping the message first would push the key
+  text past the classifier's prefix checks.
+- A **subprocess failure** (missing CLI, timeout, spawn failure) is classified
+  from the runner error variant, so a timeout is a timeout.
+- **Parse failures** (`parse_failed`, `unexpected_shape`) carry no category:
+  these describe "output was not the expected shape", which is a distinct
+  status, not a failure cause. No existing category describes that semantic.
+
+An `inspected` success result never carries a category or remediation, so a
+consumer that treats their presence as a failure signal is not misled.
+
 ### `assert_balance` semantics
 
 - `identity` — the account to query. Accepts a Stellar CLI identity name or

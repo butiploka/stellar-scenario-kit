@@ -97,6 +97,12 @@ pub struct InspectResult {
     pub interface: Option<ContractInterface>,
     /// Human-readable diagnostic. Never contains secret material.
     pub diagnostic: String,
+    /// Classified failure, when the cause was proven. Omitted on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_category: Option<String>,
+    /// The remediation for the classified failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 impl InspectResult {
@@ -125,22 +131,37 @@ impl InspectResult {
             status: InspectStatus::Error,
             interface: None,
             diagnostic: String::new(),
+            diagnostic_category: None,
+            remediation: None,
         };
 
         let output = match runner::run_capture(executable.as_os_str(), &args, timeout) {
             Ok(out) => out,
-            Err(e) => return base.with(InspectStatus::Error, format!("stellar CLI error: {e}")),
+            Err(e) => {
+                // A subprocess-level failure has a known variant, so it is
+                // classified from the variant rather than from its text.
+                let diag = crate::diagnostic::Diagnostic::classify_runner(&e);
+                return base.with(
+                    InspectStatus::Error,
+                    format!("stellar CLI error: {e}"),
+                    Some(diag),
+                );
+            }
         };
 
         if !output.is_success() {
             let detail = crate::assert::first_non_empty(&[&output.stderr, &output.stdout])
                 .unwrap_or_else(|| "<no output>".to_string());
+            // Classify the CLI's own text, not the wrapper that adds the exit
+            // code, so the `starts_with` anchors still match.
+            let diag = crate::diagnostic::Diagnostic::classify(&detail);
             return base.with(
                 InspectStatus::FetchFailed,
                 format!(
                     "stellar CLI exited with code {}: {detail}",
                     output.exit_code
                 ),
+                Some(diag),
             );
         }
 
@@ -169,6 +190,7 @@ impl InspectResult {
                         interface.functions.len(),
                         interface.events.len()
                     ),
+                    None,
                 );
                 result.interface = Some(interface);
                 result
@@ -179,14 +201,23 @@ impl InspectResult {
                 } else {
                     InspectStatus::UnexpectedShape
                 };
-                base.with(status, e)
+                base.with(status, e, None)
             }
         }
     }
 
-    fn with(mut self, status: InspectStatus, diagnostic: String) -> Self {
+    fn with(
+        mut self,
+        status: InspectStatus,
+        diagnostic: String,
+        diag: Option<crate::diagnostic::Diagnostic>,
+    ) -> Self {
         self.status = status;
         self.diagnostic = crate::simulate::redact(&diagnostic);
+        if let Some(d) = diag {
+            self.diagnostic_category = Some(d.category.as_str().to_string());
+            self.remediation = Some(d.remediation.clone());
+        }
         self
     }
 }
@@ -586,6 +617,8 @@ mod tests {
             status,
             interface: None,
             diagnostic: "d".into(),
+            diagnostic_category: None,
+            remediation: None,
         }
     }
 
