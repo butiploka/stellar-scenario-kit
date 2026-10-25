@@ -255,6 +255,99 @@ fn scaffold_missing_cli_is_fetch_failed() {
 }
 
 #[test]
+fn scaffold_missing_cli_emits_consistent_json_shape() {
+    // When find_stellar_cli fails entirely (no env override, no stellar on
+    // PATH), the JSON must match the ScaffoldResult shape, not {"error":"..."}.
+    let empty = tempfile::tempdir().expect("tempdir");
+    let mut cmd = Command::new(bin());
+    cmd.arg("scaffold")
+        .arg(fixture("valid_inspect_contract.yml"))
+        .arg("balance")
+        .arg("--output")
+        .arg("json")
+        .env("STELLAR_CLI", "")
+        .env("PATH", empty.path());
+    let output = cmd.output().expect("run scaffold");
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().expect("valid JSON");
+    assert_eq!(
+        v.get("status").and_then(|s| s.as_str()),
+        Some("inspect_failed")
+    );
+    assert_eq!(
+        v.get("contract_id").and_then(|s| s.as_str()),
+        Some("CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")
+    );
+    assert_eq!(v.get("function").and_then(|s| s.as_str()), Some("balance"));
+    assert!(
+        v.get("diagnostic_category").is_some(),
+        "missing diagnostic_category"
+    );
+    assert!(v.get("remediation").is_some(), "missing remediation");
+    assert!(v.get("diagnostic").is_some(), "missing diagnostic");
+    assert!(!stdout.contains("\"error\""), "no bare error key: {stdout}");
+}
+
+#[test]
+fn scaffold_forwards_inspect_diagnostic_category() {
+    // A fake CLI that exits non-zero with "contract not found" should let
+    // scaffold forward Classify::ContractNotFound from the inspect step.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = dir.path().join("stellar");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf 'error: contract not found: CCCC' >&2; exit 1\n",
+    )
+    .expect("write fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).expect("stat fake").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).expect("chmod");
+    }
+
+    let scenario = dir.path().join("s.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: s
+network: testnet
+steps:
+  - action: inspect_contract
+    contract_id: C
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("scaffold")
+        .arg(scenario.to_str().unwrap())
+        .arg("balance")
+        .arg("--output")
+        .arg("json")
+        .env("STELLAR_CLI", fake.to_str().unwrap());
+    let output = cmd.output().expect("run scaffold");
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().expect("valid JSON");
+    assert_eq!(
+        v.get("status").and_then(|s| s.as_str()),
+        Some("inspect_failed")
+    );
+    assert_eq!(
+        v.get("diagnostic_category").and_then(|s| s.as_str()),
+        Some("contract_not_found")
+    );
+    assert!(v
+        .get("remediation")
+        .and_then(|s| s.as_str())
+        .unwrap()
+        .contains("contract info interface"));
+}
+
+#[test]
 fn scaffold_text_output_puts_yaml_on_stdout() {
     if !stellar_runnable() {
         eprintln!("skipping: stellar CLI not available on this host");

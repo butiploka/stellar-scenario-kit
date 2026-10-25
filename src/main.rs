@@ -326,8 +326,26 @@ fn run_scaffold(
         Ok(p) => p,
         Err(e) => {
             let msg = format!("stellar CLI unavailable: {e}");
+            // Classify the missing-CLI failure so the JSON carries the same
+            // diagnostic_category and remediation the other commands report.
+            let diag = stellar_scenario::diagnostic::Diagnostic::classify_runner(&e);
+            let result = ScaffoldResult {
+                scenario: scenario.name.clone(),
+                network: scenario.network.clone(),
+                contract_id: selected.clone(),
+                function: function.clone(),
+                status: ScaffoldStatus::InspectFailed,
+                args: Vec::new(),
+                yaml: None,
+                diagnostic: stellar_scenario::simulate::redact(&msg),
+                diagnostic_category: Some(diag.category.as_str().to_string()),
+                remediation: Some(diag.remediation.clone()),
+            };
             match output {
-                OutputFormat::Json => println!("{{\"error\":\"{msg}\"}}"),
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                ),
                 OutputFormat::Text => eprintln!("error: {msg}"),
             }
             return ExitCode::from(2);

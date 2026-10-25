@@ -87,6 +87,12 @@ pub struct ScaffoldResult {
     pub yaml: Option<String>,
     /// Human-readable diagnostic. Never contains secret material.
     pub diagnostic: String,
+    /// Classified failure category, when proven. Omitted on success or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_category: Option<String>,
+    /// The remediation for the classified failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 impl ScaffoldResult {
@@ -110,6 +116,8 @@ impl ScaffoldResult {
             args: Vec::new(),
             yaml: None,
             diagnostic: String::new(),
+            diagnostic_category: None,
+            remediation: None,
         };
 
         // Collect the contract ids the scenario inspects, in step order.
@@ -175,16 +183,23 @@ impl ScaffoldResult {
             InspectStatus::Inspected => match inspected.interface {
                 Some(i) => i,
                 None => {
-                    return result.with(
+                    return result.with_diagnostic(
                         ScaffoldStatus::InspectFailed,
                         "inspect reported success but returned no interface".to_string(),
+                        None,
+                        None,
                     )
                 }
             },
+            // Forward the classified failure from the inspect step when it
+            // produced one, so scaffold reports the same proven category and
+            // remediation as `inspect` does for the same error.
             InspectStatus::FetchFailed | InspectStatus::Error => {
-                return result.with(
+                return result.with_diagnostic(
                     ScaffoldStatus::InspectFailed,
                     format!("could not inspect {contract_id}: {}", inspected.diagnostic),
+                    inspected.diagnostic_category.clone(),
+                    inspected.remediation.clone(),
                 )
             }
             other => {
@@ -262,29 +277,20 @@ impl ScaffoldResult {
         self
     }
 
-    /// Render a human-readable summary. The YAML itself is the payload, so
-    /// the text view prints the diagnostic and then the step.
-    pub fn to_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "{}: {}\n",
-            self.function,
-            match self.status {
-                ScaffoldStatus::Generated => "generated",
-                ScaffoldStatus::NoContractInScenario => "no contract in scenario",
-                ScaffoldStatus::AmbiguousContract => "ambiguous contract",
-                ScaffoldStatus::FunctionNotFound => "function not found",
-                ScaffoldStatus::UnsupportedType => "unsupported argument type",
-                ScaffoldStatus::InspectFailed => "inspect failed",
-                ScaffoldStatus::Error => "error",
-            }
-        ));
-        out.push_str(&format!("  {}\n", self.diagnostic));
-        if let Some(yaml) = &self.yaml {
-            out.push('\n');
-            out.push_str(yaml);
-        }
-        out
+    /// Set status, diagnostic, and optionally the classified failure info.
+    /// This forwards diagnostic_category and remediation from InspectResult.
+    fn with_diagnostic(
+        mut self,
+        status: ScaffoldStatus,
+        diagnostic: String,
+        category: Option<String>,
+        remediation: Option<String>,
+    ) -> Self {
+        self.status = status;
+        self.diagnostic = crate::simulate::redact(&diagnostic);
+        self.diagnostic_category = category;
+        self.remediation = remediation;
+        self
     }
 }
 
