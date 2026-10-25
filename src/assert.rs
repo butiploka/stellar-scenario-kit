@@ -72,6 +72,14 @@ pub struct AssertBalanceResult {
     pub status: AssertStatus,
     /// Human-readable diagnostic. Never contains secret material.
     pub diagnostic: String,
+    /// Classified failure, when the cause was proven.
+    ///
+    /// Omitted on success, and on failures whose cause is not recognized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_category: Option<crate::diagnostic::DiagnosticCategory>,
+    /// The remediation for [`Self::diagnostic_category`], when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 /// Outcome of a balance assertion.
@@ -157,6 +165,18 @@ impl<'a> AssertCtx<'a> {
     }
 
     fn error(self, diagnostic: &str) -> AssertBalanceResult {
+        self.error_with(diagnostic, None)
+    }
+
+    fn error_with(
+        self,
+        diagnostic: &str,
+        diag: Option<crate::diagnostic::Diagnostic>,
+    ) -> AssertBalanceResult {
+        let (category, remediation) = match diag {
+            Some(d) => (Some(d.category), Some(d.remediation)),
+            None => (None, None),
+        };
         AssertBalanceResult {
             scenario: self.scenario.name.clone(),
             step_index: self.step_index,
@@ -168,7 +188,9 @@ impl<'a> AssertCtx<'a> {
             expected_min_balance: self.expected_min_balance,
             actual_balance: None,
             status: AssertStatus::Error,
-            diagnostic: diagnostic.to_string(),
+            diagnostic: crate::simulate::redact(diagnostic),
+            diagnostic_category: category,
+            remediation,
         }
     }
 
@@ -184,7 +206,9 @@ impl<'a> AssertCtx<'a> {
             expected_min_balance: self.expected_min_balance,
             actual_balance: Some(actual.to_string()),
             status,
-            diagnostic: diagnostic.to_string(),
+            diagnostic: crate::simulate::redact(diagnostic),
+            diagnostic_category: None,
+            remediation: None,
         }
     }
 }
@@ -226,11 +250,15 @@ impl AssertBalanceResult {
             Ok(output) if !output.is_success() => {
                 let detail = first_non_empty(&[&output.stderr, &output.stdout])
                     .unwrap_or_else(|| "<no output>".to_string());
-                let diagnostic = format!(
+                // Classify from the raw CLI message, before we wrap it in the
+                // exit-code prefix. The wrapper would push the key text past
+                // the `starts_with` checks in the classifier.
+                let raw_diag = crate::diagnostic::Diagnostic::classify(&detail);
+                let diagnostic = crate::simulate::redact(&format!(
                     "stellar CLI exited with code {}: {detail}",
                     output.exit_code
-                );
-                ctx.error(&crate::simulate::redact(&diagnostic))
+                ));
+                ctx.error_with(&diagnostic, Some(raw_diag))
             }
             Ok(output) => match parse_balance_json(&output.stdout) {
                 Ok(actual) => match validate_balance_string(&actual) {
@@ -251,9 +279,23 @@ impl AssertBalanceResult {
                         AssertionMode::Exists => ctx.exists_pass(&actual),
                     },
                 },
+                // The balance query reports failures as a JSON error object
+                // on stdout with exit code 0, so the cause is in the
+                // structured `type` field rather than in CLI text.
+                Err(BalanceError::Structured { typ, message }) => {
+                    let diag = crate::diagnostic::Diagnostic::classify_balance(&typ, &message);
+                    let diagnostic =
+                        crate::simulate::redact(&format!("stellar error {typ}: {}", diag.detail));
+                    ctx.error_with(&diagnostic, Some(diag))
+                }
                 Err(e) => ctx.error(&format!("failed to parse balance JSON: {e}")),
             },
-            Err(e) => ctx.error(&format!("stellar CLI error: {e}")),
+            // Classify on the RunnerError variant, so a local timeout is
+            // reported as a timeout rather than as an RPC failure.
+            Err(e) => {
+                let diag = crate::diagnostic::Diagnostic::classify_runner(&e);
+                ctx.error_with(&format!("stellar CLI error: {e}"), Some(diag))
+            }
         }
     }
 }
@@ -267,35 +309,55 @@ pub fn first_non_empty(candidates: &[&String]) -> Option<String> {
         .map(String::from)
 }
 
-/// Parse `{"balance":"<value>"}` or `{"error":{...}}` from stdout.
+/// A balance-query failure.
 ///
-/// Returns:
-/// - `Ok(balance)` on success
-/// - `Err(...)` when the JSON carries an error object, is malformed, or is
-///   missing the `balance` field
+/// The CLI reports these as a JSON error object on stdout with exit code 0,
+/// so the cause lives in the structured `type` field rather than in CLI text.
+/// Keeping them separate lets the caller classify from the type instead of
+/// guessing from a message.
+#[derive(Debug)]
+enum BalanceError {
+    /// A structured `{"error": {"type": ..., "message": ...}}` object.
+    Structured { typ: String, message: String },
+    /// The output was not valid JSON, or had no `balance` field.
+    Malformed(String),
+}
+
+impl std::fmt::Display for BalanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Structured { typ, message } => write!(f, "stellar error {typ}: {message}"),
+            Self::Malformed(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Parse `{"balance":"<value>"}` or `{"error":{...}}` from stdout.
 ///
 /// There is deliberately no success path that yields "no balance": a balance
 /// query either returns a balance or fails. Collapsing "no balance" into a
 /// success would let a missing account read as a zero balance.
-fn parse_balance_json(stdout: &str) -> Result<String, String> {
-    let v: serde_json::Value = serde_json::from_str(stdout).map_err(|e| e.to_string())?;
+fn parse_balance_json(stdout: &str) -> Result<String, BalanceError> {
+    let v: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|e| BalanceError::Malformed(e.to_string()))?;
     if let Some(error) = v.get("error") {
         let typ = error
             .get("type")
             .and_then(|t| t.as_str())
-            .unwrap_or("unknown");
-        let msg = error
+            .unwrap_or("unknown")
+            .to_string();
+        let message = error
             .get("message")
             .and_then(|m| m.as_str())
-            .unwrap_or("no message");
-        return Err(format!("stellar error {typ}: {msg}"));
+            .unwrap_or("no message")
+            .to_string();
+        return Err(BalanceError::Structured { typ, message });
     }
-    let balance = v
-        .get("balance")
-        .and_then(|b| b.as_str())
-        .ok_or_else(|| "missing 'balance' field in JSON output".to_string())?;
+    let balance = v.get("balance").and_then(|b| b.as_str()).ok_or_else(|| {
+        BalanceError::Malformed("missing 'balance' field in JSON output".to_string())
+    })?;
     if balance.trim().is_empty() {
-        return Err("balance is empty".to_string());
+        return Err(BalanceError::Malformed("balance is empty".to_string()));
     }
     Ok(balance.to_string())
 }
@@ -536,25 +598,43 @@ mod tests {
 
     #[test]
     fn parse_error_json() {
-        let err = parse_balance_json(
+        // A structured error keeps the CLI's `type` and `message` separate,
+        // so the caller can classify from the type instead of guessing.
+        match parse_balance_json(
             "{\"error\":{\"type\":\"invalid_address\",\"message\":\"not found\"}}\n",
         )
-        .unwrap_err();
-        assert!(err.contains("invalid_address"));
-        assert!(err.contains("not found"));
+        .unwrap_err()
+        {
+            BalanceError::Structured { typ, message } => {
+                assert_eq!(typ, "invalid_address");
+                assert_eq!(message, "not found");
+            }
+            BalanceError::Malformed(m) => panic!("expected structured error, got {m}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_json_with_no_message() {
+        match parse_balance_json("{\"error\":{\"type\":\"sac_not_deployed\"}}\n").unwrap_err() {
+            BalanceError::Structured { typ, message } => {
+                assert_eq!(typ, "sac_not_deployed");
+                assert_eq!(message, "no message");
+            }
+            BalanceError::Malformed(m) => panic!("expected structured error, got {m}"),
+        }
     }
 
     #[test]
     fn parse_missing_balance_field() {
         let err = parse_balance_json("{\"decimals\":7}\n").unwrap_err();
-        assert!(err.contains("missing 'balance'"));
+        assert!(err.to_string().contains("missing 'balance'"));
     }
 
     #[test]
     fn parse_malformed_json() {
         let err = parse_balance_json("not json").unwrap_err();
         assert!(
-            err.contains("json") || err.contains("expected") || err.contains("line 1"),
+            err.to_string().contains("json") || err.to_string().contains("expected"),
             "unexpected message: {err}"
         );
     }
@@ -740,6 +820,8 @@ steps:
             actual_balance: actual.map(String::from),
             status,
             diagnostic: "d".into(),
+            diagnostic_category: None,
+            remediation: None,
         }
     }
 

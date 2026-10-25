@@ -46,8 +46,28 @@ pub enum DiagnosticCategory {
     HostError,
     /// The simulated envelope could not be decoded.
     DecodeFailed,
+    /// Decoding succeeded but the output is not the expected shape.
+    ///
+    /// The CLI exited 0 and emitted valid JSON, yet the fields the report
+    /// reads are absent. This is distinct from `decode_failed`: the envelope
+    /// decoded, the structure just did not match.
+    MalformedDecodedOutput,
+    /// A subprocess exceeded its timeout and was killed.
+    ///
+    /// This is a *local* timeout: the CLI did not answer in time. It is not
+    /// evidence that the RPC is down, only that this call did not complete.
+    Timeout,
     /// The CLI produced no output at all.
     EmptyOutput,
+    /// A classic asset's Stellar Asset Contract is not deployed on the network.
+    ///
+    /// Reported by `stellar token balance` as `type: "sac_not_deployed"`.
+    AssetNotDeployed,
+    /// The account has no trustline for the queried asset.
+    ///
+    /// Reported as a host error whose message contains
+    /// `trustline entry is missing for account`.
+    TrustlineMissing,
     /// Not recognized. The original message is preserved.
     Unknown,
 }
@@ -92,9 +112,28 @@ impl DiagnosticCategory {
                 "the simulated envelope could not be decoded; this usually means the CLI \
                  version and the envelope disagree"
             }
+            Self::MalformedDecodedOutput => {
+                "the simulated envelope decoded but its structure was not recognized; \
+                 fee and resource figures are unavailable, though the simulation itself \
+                 succeeded"
+            }
+            Self::Timeout => {
+                "the Stellar CLI did not finish within the scenario's timeout_seconds; \
+                 raise it, or check whether the RPC endpoint is responding"
+            }
             Self::EmptyOutput => {
                 "the CLI produced no output; check that STELLAR_CLI points at a working \
                  `stellar` binary"
+            }
+            Self::AssetNotDeployed => {
+                "the classic asset has no deployed Stellar Asset Contract on this network; \
+                 use a different asset, or deploy its SAC with `stellar contract asset \
+                 deploy --asset <ASSET>`"
+            }
+            Self::TrustlineMissing => {
+                "the account has no trustline for this asset; a trustline must exist before \
+                 its balance can be read, and creating one is a ledger change this toolkit \
+                 does not perform"
             }
             Self::Unknown => "the CLI message is not recognized; read it directly for the cause",
         }
@@ -113,7 +152,11 @@ impl DiagnosticCategory {
             Self::UnsupportedOperation => "unsupported_operation",
             Self::HostError => "host_error",
             Self::DecodeFailed => "decode_failed",
+            Self::MalformedDecodedOutput => "malformed_decoded_output",
+            Self::Timeout => "timeout",
             Self::EmptyOutput => "empty_output",
+            Self::AssetNotDeployed => "asset_not_deployed",
+            Self::TrustlineMissing => "trustline_missing",
             Self::Unknown => "unknown",
         }
     }
@@ -143,6 +186,88 @@ impl Diagnostic {
             category,
             remediation: category.remediation().to_string(),
             detail: trimmed.to_string(),
+        }
+    }
+
+    /// Classify a subprocess-level failure.
+    ///
+    /// This maps on the [`crate::runner::RunnerError`] variant, not on its
+    /// rendered text. A `Timeout` is a local fact — the process was killed
+    /// after the deadline — so it is reported as `timeout`, never as
+    /// `rpc_unreachable`: a slow CLI is not proof the RPC is down.
+    pub fn classify_runner(err: &crate::runner::RunnerError) -> Self {
+        let (category, detail) = match err {
+            crate::runner::RunnerError::Timeout { secs } => (
+                DiagnosticCategory::Timeout,
+                format!("timed out after {secs}s"),
+            ),
+            crate::runner::RunnerError::NotFound { detail } => {
+                (DiagnosticCategory::Unknown, detail.clone())
+            }
+            crate::runner::RunnerError::SpawnFailed { .. } => {
+                (DiagnosticCategory::Unknown, err.to_string())
+            }
+            crate::runner::RunnerError::InvalidOutput { stream } => (
+                DiagnosticCategory::Unknown,
+                format!("non-UTF-8 output on {stream}"),
+            ),
+            crate::runner::RunnerError::NonZeroExit { stderr, .. } => {
+                // The CLI ran and failed. Its stderr is the real message, so
+                // classify that rather than the wrapper text.
+                let detail = if stderr.trim().is_empty() {
+                    err.to_string()
+                } else {
+                    stderr.trim().to_string()
+                };
+                return Self::classify(&detail);
+            }
+        };
+
+        Self {
+            category,
+            remediation: category.remediation().to_string(),
+            detail,
+        }
+    }
+
+    /// Classify a balance-query failure.
+    ///
+    /// `stellar token balance` reports failures as a JSON error object on
+    /// stdout with exit code 0, so the cause is in the structured `type`
+    /// field rather than in CLI text. This reads that field.
+    ///
+    /// Verified against Stellar CLI 28.1.0:
+    /// - `config` → the network profile is missing
+    /// - `invalid_address` → the identity or account does not resolve
+    /// - `sac_not_deployed` → the classic asset has no SAC on this network
+    /// - `invoke` → the RPC call ran and the contract returned a host error
+    pub fn classify_balance(error_type: &str, message: &str) -> Self {
+        let category = match error_type {
+            "config" => DiagnosticCategory::NetworkNotConfigured,
+            "invalid_address" => DiagnosticCategory::IdentityNotConfigured,
+            "sac_not_deployed" => DiagnosticCategory::AssetNotDeployed,
+            "invoke" if message.contains("trustline entry is missing for account") => {
+                DiagnosticCategory::TrustlineMissing
+            }
+            "invoke" => DiagnosticCategory::HostError,
+            _ => DiagnosticCategory::Unknown,
+        };
+        Self {
+            category,
+            remediation: category.remediation().to_string(),
+            detail: message.trim().to_string(),
+        }
+    }
+
+    /// Build a diagnostic for a category this module determined itself.
+    ///
+    /// Use this when the cause is already known from a structured signal,
+    /// rather than inferred from CLI text.
+    pub fn classify_structured(category: DiagnosticCategory, detail: &str) -> Self {
+        Self {
+            category,
+            remediation: category.remediation().to_string(),
+            detail: detail.trim().to_string(),
         }
     }
 
@@ -216,6 +341,7 @@ fn categorize(msg: &str) -> DiagnosticCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::RunnerError;
 
     /// Every string below was copied from real Stellar CLI 28.1.0 output.
     #[test]
@@ -370,5 +496,109 @@ mod tests {
     fn detail_is_trimmed() {
         let d = Diagnostic::classify("  ❌ error: contract not found: CAAA\n");
         assert_eq!(d.detail, "❌ error: contract not found: CAAA");
+    }
+
+    // ---- RunnerError classification ------------------------------------
+    //
+    // A local timeout is a local fact: the process was killed after the
+    // deadline. It is not evidence that the RPC endpoint is down, so it must
+    // not be reported as `rpc_unreachable`.
+
+    #[test]
+    fn runner_timeout_is_a_timeout_not_an_rpc_failure() {
+        let d = Diagnostic::classify_runner(&RunnerError::Timeout { secs: 30 });
+        assert_eq!(d.category, DiagnosticCategory::Timeout);
+        assert!(d.remediation.contains("timeout_seconds"));
+        assert!(d.detail.contains("30"));
+    }
+
+    #[test]
+    fn runner_not_found_is_not_a_timeout() {
+        let d = Diagnostic::classify_runner(&RunnerError::NotFound {
+            detail: "stellar CLI not found: not in PATH".into(),
+        });
+        assert_eq!(d.category, DiagnosticCategory::Unknown);
+        assert!(d.detail.contains("stellar CLI not found"));
+    }
+
+    #[test]
+    fn runner_nonzero_exit_is_not_a_timeout() {
+        let d = Diagnostic::classify_runner(&RunnerError::NonZeroExit {
+            exit_code: 101,
+            stderr: "error: contract not found: CAAA".to_string(),
+        });
+        // The text path classifies it, because the CLI said why.
+        assert_eq!(d.category, DiagnosticCategory::ContractNotFound);
+    }
+
+    #[test]
+    fn runner_nonzero_exit_unknown_text_stays_unknown() {
+        let d = Diagnostic::classify_runner(&RunnerError::NonZeroExit {
+            exit_code: 101,
+            stderr: "some unrecognized failure".to_string(),
+        });
+        assert_eq!(d.category, DiagnosticCategory::Unknown);
+    }
+
+    // ---- Balance-query classification ----------------------------------
+    //
+    // `stellar token balance` reports failures as a JSON error object on
+    // stdout with exit code 0, so the cause is in the structured `type`
+    // field. These types were reproduced against Stellar CLI 28.1.0.
+
+    #[test]
+    fn balance_sac_not_deployed() {
+        let d = Diagnostic::classify_balance("sac_not_deployed", "asset not deployed");
+        assert_eq!(d.category, DiagnosticCategory::AssetNotDeployed);
+        assert!(d.remediation.contains("contract asset deploy"));
+    }
+
+    #[test]
+    fn balance_trustline_missing() {
+        // Reproduced live: `stellar token balance --asset USDC:GBBD...`
+        let d = Diagnostic::classify_balance(
+            "invoke",
+            "HostError: Error(Contract, #13) ... trustline entry is missing for account",
+        );
+        assert_eq!(d.category, DiagnosticCategory::TrustlineMissing);
+        assert!(d.remediation.contains("trustline"));
+    }
+
+    #[test]
+    fn balance_other_host_error_is_host_error() {
+        let d = Diagnostic::classify_balance(
+            "invoke",
+            "HostError: Error(Contract, #6) ... account entry is missing",
+        );
+        assert_eq!(d.category, DiagnosticCategory::HostError);
+    }
+
+    #[test]
+    fn balance_config_error_maps_to_network() {
+        let d =
+            Diagnostic::classify_balance("config", "Failed to find config network for nosuchnet");
+        assert_eq!(d.category, DiagnosticCategory::NetworkNotConfigured);
+    }
+
+    #[test]
+    fn balance_invalid_address_maps_to_identity() {
+        let d = Diagnostic::classify_balance("invalid_address", "identity not found");
+        assert_eq!(d.category, DiagnosticCategory::IdentityNotConfigured);
+    }
+
+    #[test]
+    fn balance_unknown_type_stays_unknown() {
+        let d = Diagnostic::classify_balance("something_new", "unrecognized");
+        assert_eq!(d.category, DiagnosticCategory::Unknown);
+        // The original message is preserved, not replaced by a guess.
+        assert_eq!(d.detail, "unrecognized");
+    }
+
+    #[test]
+    fn balance_message_with_seed_is_redacted_by_the_caller() {
+        // classify_balance does not redact; the caller does. This asserts the
+        // detail is passed through verbatim so redaction stays in one place.
+        let d = Diagnostic::classify_balance("invoke", "trustline entry is missing");
+        assert_eq!(d.detail, "trustline entry is missing");
     }
 }

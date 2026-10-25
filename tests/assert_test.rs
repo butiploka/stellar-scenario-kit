@@ -428,6 +428,8 @@ steps:
             actual_balance: Some("0".into()),
             status: stellar_scenario::assert::AssertStatus::Fail,
             diagnostic: "balance 0 < expected 1".into(),
+            diagnostic_category: None,
+            remediation: None,
         },
         AssertBalanceResult {
             scenario: s.name.clone(),
@@ -441,6 +443,8 @@ steps:
             actual_balance: None,
             status: stellar_scenario::assert::AssertStatus::Error,
             diagnostic: "timeout".into(),
+            diagnostic_category: None,
+            remediation: None,
         },
     ];
     let rep = ScenarioReport::new(&s, results, vec![]);
@@ -509,6 +513,8 @@ steps:
             actual_balance: Some("5".into()),
             status: stellar_scenario::assert::AssertStatus::Pass,
             diagnostic: "ok".into(),
+            diagnostic_category: None,
+            remediation: None,
         }],
         vec![],
     );
@@ -554,6 +560,8 @@ steps:
             actual_balance: Some("0".into()),
             status: stellar_scenario::assert::AssertStatus::Fail,
             diagnostic: "balance 0 < expected 1".into(),
+            diagnostic_category: None,
+            remediation: None,
         }],
         vec![SkippedStep {
             step_index: 0,

@@ -24,6 +24,8 @@ fn fake_stellar(dir: &std::path::Path) -> PathBuf {
     std::fs::write(
         &path,
         r#"#!/bin/sh
+# Sleep before responding when FAKE_SLEEP is set, to exercise timeouts.
+if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi
 case "$1 $2" in
   "contract invoke")
       if [ -n "$FAKE_BUILD_ERR" ]; then printf '%s' "$FAKE_BUILD_ERR" >&2; fi
@@ -37,6 +39,10 @@ case "$1 $2" in
       if [ -n "$FAKE_DECODE_ERR" ]; then printf '%s' "$FAKE_DECODE_ERR" >&2; fi
       if [ -n "$FAKE_DECODE_OUT" ]; then printf '%s' "$FAKE_DECODE_OUT"; fi
       exit "${FAKE_DECODE_EXIT:-0}" ;;
+  "token balance")
+      if [ -n "$FAKE_BALANCE_ERR" ]; then printf '%s' "$FAKE_BALANCE_ERR" >&2; fi
+      if [ -n "$FAKE_BALANCE_OUT" ]; then printf '%s' "$FAKE_BALANCE_OUT"; fi
+      exit "${FAKE_BALANCE_EXIT:-0}" ;;
   *) exit 0 ;;
 esac
 "#,
@@ -347,7 +353,8 @@ steps:
         .arg(scenario.to_str().unwrap())
         .env("STELLAR_CLI", fake.to_str().unwrap())
         .env("FAKE_BUILD_OUT", "FAKEENVELOPE")
-        .env("FAKE_SIM_OUT", "SIMULATEDENVELOPE");
+        .env("FAKE_SIM_OUT", "SIMULATEDENVELOPE")
+        .env("FAKE_DECODE_OUT", r#"{"tx":{"tx":{"fee":7266,"ext":{"v1":{"resources":{"instructions":141406},"resource_fee":"7166"}}}}}"#);
     let output = cmd.output().expect("run simulate");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let v: serde_json::Value = stdout.parse().unwrap();
@@ -397,4 +404,297 @@ steps:
         stderr.contains("contract info interface"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn simulate_timeout_is_classified_as_timeout() {
+    // The runner uses the `timeout` command. A fake CLI that sleeps longer
+    // than the scenario's timeout_seconds triggers the Timeout variant.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+source: deployer
+timeout_seconds: 2
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: balance
+    args: ["--id", "deployer"]
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("simulate")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        // The fake CLI sleeps 10s on every command; timeout_seconds is 2.
+        .env("FAKE_SLEEP", "10");
+    let output = cmd.output().expect("run simulate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    // A timeout during envelope build is reported as `build_failed`, but the
+    // category is still `timeout` because the runner classified the
+    // RunnerError::Timeout variant.
+    assert_eq!(res["status"], "build_failed");
+    assert_eq!(res["diagnostic_category"], "timeout");
+    assert!(
+        res["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("timeout_seconds"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn simulate_malformed_decode_output_is_classified() {
+    // Decode exits 0, so the envelope decoded, but the document is not the
+    // shape this build reads. The simulation itself succeeded; only fee and
+    // resource figures are unavailable.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+source: deployer
+steps:
+  - action: simulate_invoke
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+    function: balance
+    args: ["--id", "deployer"]
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("simulate")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        .env("FAKE_BUILD_OUT", "FAKEENVELOPE")
+        .env("FAKE_SIM_OUT", "SIMULATEDENVELOPE")
+        // Decode succeeds but returns an empty object.
+        .env("FAKE_DECODE_OUT", "{}");
+    let output = cmd.output().expect("run simulate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["status"], "simulated");
+    assert_eq!(res["diagnostic_category"], "malformed_decoded_output");
+    assert!(
+        res["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fee and resource figures"),
+        "stdout: {stdout}"
+    );
+    // The simulation still succeeded; resources are just empty.
+    assert!(res.get("resources").is_some());
+}
+
+#[test]
+fn assert_balance_structured_error_has_category() {
+    // `stellar token balance` reports failures as a JSON error object on
+    // stdout with exit code 0. The assert command must classify from the
+    // structured `type` field.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    asset: USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3FHY
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        // Fake balance returns a structured error: SAC not deployed.
+        .env(
+            "FAKE_BALANCE_OUT",
+            r#"{"error":{"type":"sac_not_deployed","message":"asset not deployed"}}"#,
+        );
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["status"], "error");
+    assert_eq!(res["diagnostic_category"], "asset_not_deployed");
+    assert!(
+        res["remediation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("contract asset deploy"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn assert_balance_redacts_seed_in_diagnostic() {
+    // A seed-shaped string must not survive into the JSON diagnostic, even
+    // when it arrives inside a structured balance error message.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let seed = "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        .env(
+            "FAKE_BALANCE_OUT",
+            format!(r#"{{"error":{{"type":"invoke","message":"failed for (key {seed})"}}}}"#),
+        );
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(seed), "seed survived redaction: {stdout}");
+    assert!(stdout.contains("<redacted-secret>"), "stdout: {stdout}");
+    // The category is still derived from the structured type.
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["diagnostic_category"], "host_error");
+}
+
+#[test]
+fn assert_balance_nonzero_exit_redacts_and_classifies() {
+    // A non-zero exit is a CLI failure, not a balance. The CLI's own message
+    // is preserved (redacted) and classified.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let seed = "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        .env("FAKE_BALANCE_EXIT", "101")
+        .env(
+            "FAKE_BALANCE_ERR",
+            format!("error: Failed to find config network for nosuchnet (key {seed})"),
+        );
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(seed), "seed survived redaction: {stdout}");
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["status"], "error");
+    assert_eq!(res["diagnostic_category"], "network_not_configured");
+}
+
+#[test]
+fn assert_balance_unknown_error_stays_unknown() {
+    // An unrecognized structured type must not be forced into a category.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        .env(
+            "FAKE_BALANCE_OUT",
+            r#"{"error":{"type":"some_future_type","message":"a cause this build does not know"}}"#,
+        );
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["diagnostic_category"], "unknown");
+    // The original message is preserved for the user to read.
+    assert!(res["diagnostic"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("a cause this build does not know"));
+}
+
+#[test]
+fn assert_balance_success_has_no_category() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        .env("FAKE_BALANCE_OUT", r#"{"balance":"1000000000"}"#);
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["status"], "pass");
+    assert!(
+        res.get("diagnostic_category").is_none(),
+        "success must not carry a category: {stdout}"
+    );
+    assert!(res.get("remediation").is_none(), "stdout: {stdout}");
 }

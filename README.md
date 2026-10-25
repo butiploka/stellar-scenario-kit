@@ -570,14 +570,59 @@ before being added; anything unrecognized keeps the original message and
 | `unsupported_operation` | The envelope is a classic operation | `only Soroban InvokeHostFunction envelopes can be simulated; payments and other classic operations cannot` |
 | `host_error` | The contract returned a runtime error | `the contract rejected the call at runtime; the event log in the CLI output names the failing function and reason` |
 | `decode_failed` | The simulated envelope could not be decoded | `the simulated envelope could not be decoded; this usually means the CLI version and the envelope disagree` |
+| `malformed_decoded_output` | Decoding succeeded but the document is not the expected shape | `the simulated envelope decoded but its structure was not recognized; fee and resource figures are unavailable, though the simulation itself succeeded` |
+| `timeout` | The CLI did not finish within `timeout_seconds` | `the Stellar CLI did not finish within the scenario's timeout_seconds; raise it, or check whether the RPC endpoint is responding` |
 | `empty_output` | The CLI produced no output at all | `the CLI produced no output; check that STELLAR_CLI points at a working stellar binary` |
 | `unknown` | Not recognized | `the CLI message is not recognized; read it directly for the cause` |
+
+**A `timeout` is a local fact, not a diagnosis of the network.** It means the
+subprocess was killed after the deadline. It is deliberately *not* reported as
+`rpc_unreachable`, because a slow CLI is not proof that the RPC endpoint is
+down — the two need different fixes, and conflating them sends the user to
+check the wrong thing. `timeout` is derived from the runner's own
+`RunnerError::Timeout` variant, never from matching the word "timeout" in CLI
+text.
 
 **Secrets are never emitted.** A diagnostic passes through `redact()` before
 it reaches JSON or text output. The redactor catches a 56-character
 `S`-prefixed seed anywhere in the text, including inside punctuation, so
 `(key SAAA...)` becomes `(key <redacted-secret>...)`. The remediation field
 is a fixed string per category and cannot carry any CLI text.
+
+### Assertion diagnostics
+
+The `assert` command reports the same `diagnostic_category` and `remediation`
+fields on `assert_balance` and `assert_asset` error results. The categories
+are the same set, plus two that only a balance query can produce:
+
+| Category | When it appears | Remediation |
+|----------|-----------------|-------------|
+| `asset_not_deployed` | The classic asset has no Stellar Asset Contract on the network | `the classic asset has no deployed Stellar Asset Contract on this network; use a different asset, or deploy its SAC with stellar contract asset deploy --asset <ASSET>` |
+| `trustline_missing` | The account has no trustline for the asset | `the account has no trustline for this asset; a trustline must exist before its balance can be read, and creating one is a ledger change this toolkit does not perform` |
+
+Assertion errors are classified from a different signal than simulation
+errors, because the CLI reports them differently:
+
+- A **structured error** (`{"error":{"type":...,"message":...}}` on stdout
+  with exit code 0) is classified from the `type` field. The `type` values
+  `config`, `invalid_address`, `sac_not_deployed`, and `invoke` map to the
+  categories above; any other type stays `unknown`.
+- A **non-zero exit** is classified from the CLI's raw stderr, before the
+  exit-code prefix is added. Wrapping the message first would push the key
+  text past the classifier's prefix checks and turn a recognizable error into
+  `unknown`.
+- A **subprocess failure** (timeout, spawn failure, missing executable) is
+  classified from the runner error variant, so a timeout is a timeout.
+
+A `pass` result never carries a category or remediation, so a consumer that
+treats their presence as a failure signal is not misled.
+
+**What classification does not promise.** The categories cover only error
+shapes that were reproduced against Stellar CLI 28.1.0. A future CLI version,
+a new RPC failure mode, or a differently-worded error will land in `unknown`
+with its original message intact — that is the intended behavior, not a gap to
+be closed by loosening the matchers. Adding a category requires reproducing
+the error first; a plausible-looking string match is not evidence.
 
 ### `assert_balance` semantics
 
@@ -702,7 +747,10 @@ Assertion report (`assert` command):
 Each entry in `results` has `scenario`, `step_index`, `action`, `mode`
 (`min_balance` or `exists`), `account`, `network`, `asset`,
 `expected_min_balance` (string or null), `actual_balance` (string or null),
-`status` (`pass`, `fail`, or `error`), and `diagnostic`.
+`status` (`pass`, `fail`, or `error`), and `diagnostic`. On a classified
+error it also carries `diagnostic_category` and `remediation`; both are
+omitted on `pass` and `fail`, and on an error whose cause was not recognized.
+See [Assertion diagnostics](#assertion-diagnostics).
 
 Each entry in `skipped` has `step_index`, `action`, and `reason`
 (`would_mutate` or `not_executable`).
@@ -739,7 +787,10 @@ Each entry in `results` has `scenario`, `step_index`, `action`, `network`,
 `remediation`.
 
 `diagnostic_category` and `remediation` are omitted on success, so a consumer
-that treats their presence as a failure signal is not misled. See
+that treats their presence as a failure signal is not misled. The one
+exception is `malformed_decoded_output`: the simulation succeeded, so
+`status` is `simulated`, but the category is still present because the fee and
+resource figures could not be read. See
 [Simulate diagnostics and remediation](#simulate-diagnostics-and-remediation)
 for the category list.
 

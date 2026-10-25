@@ -215,19 +215,9 @@ impl SimulationResult {
         let envelope = match runner::run(executable.as_os_str(), &build_refs, timeout) {
             Ok(out) => out.stdout.trim().to_string(),
             Err(e) => {
-                // `run` reports a non-zero exit as `NonZeroExit { stderr }`,
-                // which is the CLI's own error text. Classify that.
-                let detail = match &e {
-                    crate::runner::RunnerError::NonZeroExit { stderr, .. } => {
-                        if stderr.trim().is_empty() {
-                            e.to_string()
-                        } else {
-                            stderr.trim().to_string()
-                        }
-                    }
-                    _ => e.to_string(),
-                };
-                let diag = crate::diagnostic::Diagnostic::classify(&detail);
+                // Classify on the RunnerError variant, so a local timeout is
+                // reported as a timeout rather than as an RPC failure.
+                let diag = crate::diagnostic::Diagnostic::classify_runner(&e);
                 return base.with(
                     SimulationStatus::BuildFailed,
                     format!("failed to build envelope: {}", diag.detail),
@@ -257,11 +247,14 @@ impl SimulationResult {
         let simulated = match runner::run_capture(executable.as_os_str(), &sim_args, timeout) {
             Ok(out) => out,
             Err(e) => {
+                // Classify on the RunnerError variant: a local timeout is a
+                // local fact, not evidence the RPC is down.
+                let diag = crate::diagnostic::Diagnostic::classify_runner(&e);
                 return base.with(
                     SimulationStatus::Error,
                     format!("simulate subprocess error: {e}"),
-                    None,
-                )
+                    Some(diag),
+                );
             }
         };
         if !simulated.is_success() {
@@ -307,9 +300,41 @@ impl SimulationResult {
             std::ffi::OsStr::new("decode"),
             std::ffi::OsStr::new(&simulated_xdr),
         ];
-        if let Ok(out) = runner::run_capture(executable.as_os_str(), &decode_args, timeout) {
-            if out.is_success() {
-                result.resources = parse_decoded_resources(&out.stdout);
+        match runner::run_capture(executable.as_os_str(), &decode_args, timeout) {
+            Ok(out) if out.is_success() => match parse_decoded_resources(&out.stdout) {
+                Some(resources) => result.resources = resources,
+                None => {
+                    // Decoding exited 0, so the envelope decoded, but the
+                    // document is not the shape this build reads. The
+                    // simulation still succeeded; only the fee and resource
+                    // figures are unavailable.
+                    let diag = crate::diagnostic::Diagnostic::classify_structured(
+                        crate::diagnostic::DiagnosticCategory::MalformedDecodedOutput,
+                        "decode succeeded but the output was not the expected document shape",
+                    );
+                    result.diagnostic = format!(
+                        "{} (fee and resource figures unavailable: {})",
+                        result.diagnostic, diag.detail
+                    );
+                    result.diagnostic_category = Some(diag.category);
+                    result.remediation = Some(diag.remediation);
+                }
+            },
+            Ok(out) => {
+                let detail = crate::assert::first_non_empty(&[&out.stderr, &out.stdout])
+                    .unwrap_or_else(|| "<no output>".to_string());
+                let diag = crate::diagnostic::Diagnostic::classify(&detail);
+                result.diagnostic =
+                    format!("{} (decode failed: {})", result.diagnostic, diag.detail);
+                result.diagnostic_category = Some(diag.category);
+                result.remediation = Some(diag.remediation);
+            }
+            Err(e) => {
+                let diag = crate::diagnostic::Diagnostic::classify_runner(&e);
+                result.diagnostic =
+                    format!("{} (decode error: {})", result.diagnostic, diag.detail);
+                result.diagnostic_category = Some(diag.category);
+                result.remediation = Some(diag.remediation);
             }
         }
 
@@ -334,18 +359,20 @@ impl SimulationResult {
 
 /// Extract fee and resource fields from `stellar tx decode` JSON.
 ///
-/// Best effort: any missing field leaves the corresponding value unset. The
-/// decoder is not part of the safety story, only of the reporting.
-fn parse_decoded_resources(json: &str) -> SimulatedResources {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return SimulatedResources::default();
-    };
-    let tx = v.get("tx").and_then(|t| t.get("tx"));
+/// Returns `None` when the document is not the expected shape, so the caller
+/// can tell "decoded but unrecognized" apart from "decoded with some fields
+/// absent". The decoder is not part of the safety story, only of the
+/// reporting.
+fn parse_decoded_resources(json: &str) -> Option<SimulatedResources> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    // A real decode always nests the transaction under `tx.tx`. Without that
+    // anchor the document is not the one this build reads.
+    let tx = v.get("tx")?.get("tx")?;
     let fee = tx
-        .and_then(|t| t.get("fee"))
+        .get("fee")
         .and_then(|f| f.as_u64())
         .map(|f| f.to_string());
-    let ext_v1 = tx.and_then(|t| t.get("ext")).and_then(|e| e.get("v1"));
+    let ext_v1 = tx.get("ext").and_then(|e| e.get("v1"));
     let resources = ext_v1.and_then(|e| e.get("resources"));
     let resource_fee = ext_v1
         .and_then(|e| e.get("resource_fee"))
@@ -355,11 +382,11 @@ fn parse_decoded_resources(json: &str) -> SimulatedResources {
         .and_then(|r| r.get("instructions"))
         .and_then(|i| i.as_u64());
 
-    SimulatedResources {
+    Some(SimulatedResources {
         fee,
         resource_fee,
         instructions,
-    }
+    })
 }
 
 /// Redact anything shaped like a Stellar secret seed from a diagnostic.
@@ -692,24 +719,30 @@ mod tests {
         // Shape taken from a real `stellar tx decode` output: resource_fee is
         // a sibling of `resources` under `ext.v1`, not a child of it.
         let json = r#"{"tx":{"tx":{"fee":7266,"ext":{"v1":{"resources":{"instructions":141406},"resource_fee":"7166"}}}}}"#;
-        let r = parse_decoded_resources(json);
+        let r = parse_decoded_resources(json).expect("recognized shape");
         assert_eq!(r.fee.as_deref(), Some("7266"));
         assert_eq!(r.resource_fee.as_deref(), Some("7166"));
         assert_eq!(r.instructions, Some(141406));
     }
 
     #[test]
-    fn parse_decoded_resources_tolerates_missing_fields() {
-        let r = parse_decoded_resources("{}");
-        assert!(r.fee.is_none());
-        assert!(r.resource_fee.is_none());
-        assert!(r.instructions.is_none());
+    fn parse_decoded_resources_rejects_unexpected_shape() {
+        // Decode exited 0, so the envelope decoded, but the document is not
+        // the one this build reads. The caller must be able to tell this
+        // apart from "decoded with fields absent".
+        assert!(parse_decoded_resources("{}").is_none());
+        assert!(parse_decoded_resources("not json").is_none());
+        assert!(parse_decoded_resources(r#"{"tx":{}}"#).is_none());
     }
 
     #[test]
-    fn parse_decoded_resources_tolerates_malformed_json() {
-        let r = parse_decoded_resources("not json");
+    fn parse_decoded_resources_tolerates_missing_optional_fields() {
+        // The `tx.tx` anchor is present, so the shape is recognized; the
+        // individual figures are legitimately absent.
+        let r = parse_decoded_resources(r#"{"tx":{"tx":{}}}"#).expect("recognized shape");
         assert!(r.fee.is_none());
+        assert!(r.resource_fee.is_none());
+        assert!(r.instructions.is_none());
     }
 
     fn scenario_with(raw: &str) -> Scenario {
