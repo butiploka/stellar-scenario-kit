@@ -548,6 +548,49 @@ steps:
 }
 
 #[test]
+fn assert_balance_nonzero_exit_with_json_uses_structured_category() {
+    // A structured JSON error on stdout with a NON-zero exit (verified:
+    // `stellar token balance --output json` exits 1 for `invalid_asset` and
+    // `invalid_address`) must be routed through `classify_balance`, not read
+    // as raw text. The `if let Err(Structured{...})` in the non-zero branch
+    // must fire before the text fallback.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    asset: "UNRESOLVED:GBZRRHOV4GKVTXNOH7YPGGQNDPEE7JSA6R4A3HFQLXUYK2MWLBWVDAWN"
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        // Real `stellar token balance --output json` exits 1 for
+        // invalid_asset; the fake must reproduce that non-zero exit.
+        .env("FAKE_BALANCE_EXIT", "1")
+        .env(
+            "FAKE_BALANCE_OUT",
+            r#"{"error":{"type":"invalid_asset","message":"Failed to find config identity for UNKNOWN_ISSUER"}}"#,
+        );
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["status"], "error");
+    assert_eq!(res["diagnostic_category"], "identity_not_configured");
+}
+
+#[test]
 fn assert_balance_redacts_seed_in_diagnostic() {
     // A seed-shaped string must not survive into the JSON diagnostic, even
     // when it arrives inside a structured balance error message.
