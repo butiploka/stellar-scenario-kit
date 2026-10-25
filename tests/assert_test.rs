@@ -389,6 +389,44 @@ steps:
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// An asset whose issuer is not a configured identity exits 1 with a JSON
+/// error object on stdout. The structured path must run *before* the raw-text
+/// fallback, or the JSON is read as arbitrary text and classified `unknown`.
+/// Verified live: `stellar token balance --id UNRESOLVED:<addr> --output json`
+/// → `{"error":{"type":"invalid_asset",...}}`, exit 1.
+#[test]
+fn assert_invalid_asset_issuer_is_classified() {
+    if !stellar_runnable() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    let output = assert_cmd(&fixture("assert_invalid_asset_issuer.yml"))
+        .output()
+        .expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = stdout.parse().unwrap();
+    let results = parsed.get("results").unwrap().as_array().unwrap();
+
+    let status = results[0].get("status").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(status, "error");
+    assert_eq!(output.status.code(), Some(2));
+
+    let category = results[0]
+        .get("diagnostic_category")
+        .and_then(|v| v.as_str())
+        .expect("diagnostic_category present");
+    assert_eq!(category, "identity_not_configured");
+    let remediation = results[0]
+        .get("remediation")
+        .and_then(|v| v.as_str())
+        .expect("remediation present");
+    assert!(
+        remediation.contains("keys generate"),
+        "remediation: {remediation}"
+    );
+}
+
 // ------------------------------------------------------- report-level tests
 
 #[test]

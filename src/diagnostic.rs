@@ -245,6 +245,11 @@ impl Diagnostic {
         let category = match error_type {
             "config" => DiagnosticCategory::NetworkNotConfigured,
             "invalid_address" => DiagnosticCategory::IdentityNotConfigured,
+            // The asset issuer is resolved as a config identity; when it is
+            // missing the CLI reports `invalid_asset` with a
+            // "Failed to find config identity for" message, matching the
+            // text-based `Failed to find config identity for` → identity case.
+            "invalid_asset" => DiagnosticCategory::IdentityNotConfigured,
             "sac_not_deployed" => DiagnosticCategory::AssetNotDeployed,
             "invoke" if message.contains("trustline entry is missing for account") => {
                 DiagnosticCategory::TrustlineMissing
@@ -583,6 +588,17 @@ mod tests {
     #[test]
     fn balance_invalid_address_maps_to_identity() {
         let d = Diagnostic::classify_balance("invalid_address", "identity not found");
+        assert_eq!(d.category, DiagnosticCategory::IdentityNotConfigured);
+    }
+
+    #[test]
+    fn balance_invalid_asset_maps_to_identity() {
+        // When an asset's issuer is not a known config identity, the CLI
+        // reports `invalid_asset` with "Failed to find config identity for".
+        let d = Diagnostic::classify_balance(
+            "invalid_asset",
+            "Failed to find config identity for GBZRRHOV4GKVTXNOH7YPGGQNDPEE7JSA6R4A3HFQLXUYK2MWLBWVDAWN",
+        );
         assert_eq!(d.category, DiagnosticCategory::IdentityNotConfigured);
     }
 

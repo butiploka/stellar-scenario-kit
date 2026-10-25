@@ -243,16 +243,25 @@ impl AssertBalanceResult {
             runner::run_capture(executable.as_os_str(), &args, scenario.timeout_duration());
 
         match run_result {
-            // A non-zero exit is a CLI failure, not a balance. Report it with
-            // whatever context the CLI gave, before trying to parse stdout:
-            // a failed command may emit nothing, or a partial document, and
-            // reading that as "malformed JSON" hides the real error.
+            // A non-zero exit is a CLI failure, not a balance. Try the
+            // structured JSON path first: `stellar token balance --output json`
+            // reports `invalid_asset` and `invalid_address` as a JSON error
+            // object on stdout (verified: exit code 1), and classifying raw
+            // JSON text yields `unknown`.
             Ok(output) if !output.is_success() => {
+                if let Err(BalanceError::Structured { typ, message }) =
+                    parse_balance_json(&output.stdout)
+                {
+                    let diag = crate::diagnostic::Diagnostic::classify_balance(&typ, &message);
+                    let diagnostic =
+                        crate::simulate::redact(&format!("stellar error {typ}: {}", diag.detail));
+                    return ctx.error_with(&diagnostic, Some(diag));
+                }
+                // Fallback: classify the raw CLI text. A failed command may
+                // emit nothing, or a partial document, and reading that as
+                // "malformed JSON" hides the real error.
                 let detail = first_non_empty(&[&output.stderr, &output.stdout])
                     .unwrap_or_else(|| "<no output>".to_string());
-                // Classify from the raw CLI message, before we wrap it in the
-                // exit-code prefix. The wrapper would push the key text past
-                // the `starts_with` checks in the classifier.
                 let raw_diag = crate::diagnostic::Diagnostic::classify(&detail);
                 let diagnostic = crate::simulate::redact(&format!(
                     "stellar CLI exited with code {}: {detail}",
@@ -280,8 +289,9 @@ impl AssertBalanceResult {
                     },
                 },
                 // The balance query reports failures as a JSON error object
-                // on stdout with exit code 0, so the cause is in the
-                // structured `type` field rather than in CLI text.
+                // on stdout. Some failures exit 0 (e.g. `sac_not_decommited`
+                // via a host error), others exit 1 (e.g. `invalid_asset`,
+                // `invalid_address`); both carry the `type` field the same way.
                 Err(BalanceError::Structured { typ, message }) => {
                     let diag = crate::diagnostic::Diagnostic::classify_balance(&typ, &message);
                     let diagnostic =

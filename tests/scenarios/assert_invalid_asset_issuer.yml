@@ -1,0 +1,8 @@
+schema_version: "1.0"
+name: assert_invalid_asset_issuer
+network: testnet
+steps:
+  - action: assert_balance
+    identity: deployer
+    asset: UNRESOLVED:GBZRRHOV4GKVTXNOH7YPGGQNDPEE7JSA6R4A3HFQLXUYK2MWLBWVDAWN
+    min_balance: "1"
