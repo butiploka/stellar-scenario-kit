@@ -1,0 +1,7 @@
+schema_version: "1.0"
+name: assert_balance_over_u128
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "340282366920938463463374607431768211456"

@@ -320,9 +320,13 @@ fn parse_decoded_resources(json: &str) -> SimulatedResources {
 /// Redact anything shaped like a Stellar secret seed from a diagnostic.
 ///
 /// A seed is a 56-character base32 string starting with `S`. Nothing in this
-/// module passes a key to the CLI, but a CLI error could echo one back, so
+/// toolkit passes a key to the CLI, but a CLI error could echo one back, so
 /// diagnostics are scrubbed before they reach a report.
-fn redact(text: &str) -> String {
+///
+/// This is a defensive filter, not a guarantee: it matches the seed shape, so
+/// a seed split across whitespace or embedded in a longer token is not caught.
+/// The real protection is that no code path accepts a secret key as input.
+pub fn redact(text: &str) -> String {
     text.split_inclusive(|c: char| c.is_whitespace())
         .map(|token| {
             let trimmed = token.trim_end();

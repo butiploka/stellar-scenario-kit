@@ -45,6 +45,27 @@ fn assert_rejects_invalid_scenario() {
 }
 
 #[test]
+fn assert_rejects_min_balance_above_u128() {
+    assert_cmd(&fixture("invalid_assert_balance_over_u128.yml"))
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("u128"));
+}
+
+#[test]
+fn assert_accepts_min_balance_at_u128_max() {
+    // Validation must accept u128::MAX exactly; only u128::MAX + 1 is out of
+    // range. Use `validate` so the check does not depend on a live network.
+    let mut cmd = Command::new(bin());
+    cmd.arg("validate")
+        .arg(fixture("valid_assert_balance_u128_max.yml"));
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("\"result\": \"valid\""));
+}
+
+#[test]
 fn assert_rejects_zero_timeout() {
     assert_cmd(&fixture("invalid_timeout_zero.yml"))
         .assert()

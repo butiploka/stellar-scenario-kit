@@ -219,6 +219,19 @@ impl AssertBalanceResult {
             runner::run_capture(executable.as_os_str(), &args, scenario.timeout_duration());
 
         match run_result {
+            // A non-zero exit is a CLI failure, not a balance. Report it with
+            // whatever context the CLI gave, before trying to parse stdout:
+            // a failed command may emit nothing, or a partial document, and
+            // reading that as "malformed JSON" hides the real error.
+            Ok(output) if !output.is_success() => {
+                let detail = first_non_empty(&[&output.stderr, &output.stdout])
+                    .unwrap_or_else(|| "<no output>".to_string());
+                let diagnostic = format!(
+                    "stellar CLI exited with code {}: {detail}",
+                    output.exit_code
+                );
+                ctx.error(&crate::simulate::redact(&diagnostic))
+            }
             Ok(output) => match parse_balance_json(&output.stdout) {
                 Ok(actual) => match validate_balance_string(&actual) {
                     Err(e) => ctx.error(&format!("invalid balance value: {e}")),
@@ -243,6 +256,15 @@ impl AssertBalanceResult {
             Err(e) => ctx.error(&format!("stellar CLI error: {e}")),
         }
     }
+}
+
+/// Return the first non-blank string, trimmed, or `None` if all are blank.
+fn first_non_empty(candidates: &[&String]) -> Option<String> {
+    candidates
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// Parse `{"balance":"<value>"}` or `{"error":{...}}` from stdout.

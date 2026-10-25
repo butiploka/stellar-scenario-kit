@@ -437,6 +437,8 @@ operations are not simulatable through this path.
 - `min_balance` — the minimum acceptable balance, in the asset's smallest
   unit (stroops for native XLM). **Required.** Accepts a YAML integer or a
   quoted string of digits; the string form is preferred for large values.
+  Values above `u128::MAX` (`340282366920938463463374607431768211455`) are
+  rejected at validation time rather than at comparison time.
 - Comparison is `actual >= min_balance`, using unsigned 128-bit integer
   arithmetic. No floating-point arithmetic is used anywhere in the comparison.
 - A `pass` result proves that, at the moment the RPC read returned, the named
@@ -473,6 +475,14 @@ passing assertion.
 | `{"balance":""}` | Error result: balance is empty |
 | `{"balance":"12.5"}` | Error result: not a non-negative decimal integer |
 | `{"balance":"-1"}` | Error result: not a non-negative decimal integer |
+| Non-zero exit, stderr present | Error result: `stellar CLI exited with code N: <stderr>` |
+| Non-zero exit, both streams empty | Error result: `stellar CLI exited with code N: <no output>` |
+
+A non-zero exit is checked **before** the output is parsed. A failed command
+may emit nothing or a partial document; reading that as "malformed JSON"
+would hide the real cause, so the exit code and the CLI's stderr are reported
+instead. When both streams are non-empty, stderr wins, because that is the
+CLI's error channel.
 
 ### Network and account prerequisites
 
@@ -666,6 +676,7 @@ tests/
   assert_test.rs           assert command tests
   simulate_test.rs         simulate command tests
   json_contract_test.rs    JSON shape, status vocabulary, and exit-code contract
+  robustness_test.rs       subprocess failure modes via a fake CLI
   scenarios/               checked-in fixtures
 examples/                  documented example scenarios
 ```

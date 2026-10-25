@@ -244,6 +244,12 @@ fn validate_assert_balance(step: &Step, idx: usize, issues: &mut Vec<ValidationI
             message: "min_balance must be a non-negative integer, or a string of digits".into(),
             line: None,
         }),
+        Some(v) if !is_u128_representable(v) => issues.push(ValidationIssue {
+            field: format!("steps[{idx}].min_balance"),
+            message: "min_balance exceeds the u128 range (340282366920938463463374607431768211455)"
+                .into(),
+            line: None,
+        }),
         _ => {}
     }
     if let Some(v) = step.params.get("asset") {
@@ -338,6 +344,18 @@ fn is_non_negative_integer(v: &serde_yaml::Value) -> bool {
         return !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     }
     is_u64(v)
+}
+
+/// Reject digit strings that do not fit in `u128`.
+///
+/// `is_non_negative_integer` only checks the character set, so a value above
+/// `u128::MAX` passes validation and then fails at comparison time. Catching
+/// it here keeps the failure at validation, where the user is looking.
+fn is_u128_representable(v: &serde_yaml::Value) -> bool {
+    match v.as_str() {
+        Some(s) => s.parse::<u128>().is_ok(),
+        None => is_u64(v),
+    }
 }
 
 /// Find the 1-based line number of a top-level key in raw YAML text.
