@@ -550,6 +550,35 @@ That case is reported as `status: "unsupported_operation"` with exit code 1,
 not as a simulation that ran. Payments, account creation, and other classic
 operations are not simulatable through this path.
 
+### Simulate diagnostics and remediation
+
+Every `simulate_invoke` failure now carries a `diagnostic_category` and a
+`remediation` field in JSON, and the text output prints the remediation on
+its own line. The categories below were reproduced against Stellar CLI 28.1.0
+before being added; anything unrecognized keeps the original message and
+`category: "unknown"`.
+
+| Category | When it appears | Remediation |
+|----------|-----------------|-------------|
+| `contract_not_found` | The contract id does not exist on the network | `check the contract_id; confirm it exists on the target network with stellar contract info interface --id <id> --network <n>` |
+| `function_not_found` | The function name is not in the contract interface | `check the function name; run stellar-scenario inspect <file> --output text to list what the contract exposes` |
+| `missing_argument` | A required argument was omitted | `add the missing argument; the CLI names it in its error` |
+| `invalid_argument` | An argument was present but the wrong type | `check the argument's type; the CLI states the expected type in its error` |
+| `network_not_configured` | The network profile is not in the Stellar CLI config | `add the network with stellar network add <name> --rpc-url <url> --network-passphrase <passphrase>, or use one from stellar network ls` |
+| `identity_not_configured` | The source identity is not in the Stellar CLI config | `add the identity with stellar keys generate <name>, or use one from stellar keys ls` |
+| `rpc_unreachable` | The RPC endpoint could not be reached | `check network connectivity and the RPC URL; confirm with stellar network info` |
+| `unsupported_operation` | The envelope is a classic operation | `only Soroban InvokeHostFunction envelopes can be simulated; payments and other classic operations cannot` |
+| `host_error` | The contract returned a runtime error | `the contract rejected the call at runtime; the event log in the CLI output names the failing function and reason` |
+| `decode_failed` | The simulated envelope could not be decoded | `the simulated envelope could not be decoded; this usually means the CLI version and the envelope disagree` |
+| `empty_output` | The CLI produced no output at all | `the CLI produced no output; check that STELLAR_CLI points at a working stellar binary` |
+| `unknown` | Not recognized | `the CLI message is not recognized; read it directly for the cause` |
+
+**Secrets are never emitted.** A diagnostic passes through `redact()` before
+it reaches JSON or text output. The redactor catches a 56-character
+`S`-prefixed seed anywhere in the text, including inside punctuation, so
+`(key SAAA...)` becomes `(key <redacted-secret>...)`. The remediation field
+is a fixed string per category and cannot carry any CLI text.
+
 ### `assert_balance` semantics
 
 - `identity` — the account to query. Accepts a Stellar CLI identity name or
@@ -706,7 +735,13 @@ Simulation report (`simulate` command):
 Each entry in `results` has `scenario`, `step_index`, `action`, `network`,
 `source`, `contract_id`, `function`, `simulated` (always `true`), `submitted`
 (always `false`), `status`, `envelope_sha256` (string or null), `resources`,
-and `diagnostic`.
+`diagnostic`, and — on a classified failure — `diagnostic_category` and
+`remediation`.
+
+`diagnostic_category` and `remediation` are omitted on success, so a consumer
+that treats their presence as a failure signal is not misled. See
+[Simulate diagnostics and remediation](#simulate-diagnostics-and-remediation)
+for the category list.
 
 `envelope_sha256` is the SHA-256 of the base64 string returned by
 `stellar tx simulate` — a content fingerprint of the *encoded* envelope, not a

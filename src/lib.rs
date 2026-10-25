@@ -13,6 +13,7 @@
 
 pub mod assert;
 pub mod cli;
+pub mod diagnostic;
 pub mod error;
 pub mod inspect;
 pub mod plan;

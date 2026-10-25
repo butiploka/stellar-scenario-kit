@@ -62,6 +62,7 @@ src/
   stellar.rs      Stellar CLI discovery and read-only diagnostics
   assert.rs       balance/asset assertion model, execution, and reporting
   simulate.rs     transaction simulation model, execution, and reporting
+  diagnostic.rs   classify CLI failures and name the remediation
   inspect.rs      contract interface parsing and reporting
   scaffold.rs     generate a simulate_invoke step from an interface
 tests/

@@ -121,6 +121,15 @@ pub struct SimulationResult {
     pub resources: SimulatedResources,
     /// Human-readable diagnostic. Never contains secret material.
     pub diagnostic: String,
+    /// Classified failure, when the diagnostic came from a CLI error.
+    ///
+    /// Present only when the CLI produced a recognizable error. Absent on
+    /// success, so a consumer that does not read it is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_category: Option<crate::diagnostic::DiagnosticCategory>,
+    /// The remediation for [`Self::diagnostic_category`], when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
 }
 
 impl SimulationResult {
@@ -180,6 +189,8 @@ impl SimulationResult {
             envelope_sha256: None,
             resources: SimulatedResources::default(),
             diagnostic: String::new(),
+            diagnostic_category: None,
+            remediation: None,
         };
 
         // Step 1 — build the envelope. No signing, no submission.
@@ -204,16 +215,32 @@ impl SimulationResult {
         let envelope = match runner::run(executable.as_os_str(), &build_refs, timeout) {
             Ok(out) => out.stdout.trim().to_string(),
             Err(e) => {
+                // `run` reports a non-zero exit as `NonZeroExit { stderr }`,
+                // which is the CLI's own error text. Classify that.
+                let detail = match &e {
+                    crate::runner::RunnerError::NonZeroExit { stderr, .. } => {
+                        if stderr.trim().is_empty() {
+                            e.to_string()
+                        } else {
+                            stderr.trim().to_string()
+                        }
+                    }
+                    _ => e.to_string(),
+                };
+                let diag = crate::diagnostic::Diagnostic::classify(&detail);
                 return base.with(
                     SimulationStatus::BuildFailed,
-                    format!("failed to build envelope: {e}"),
-                )
+                    format!("failed to build envelope: {}", diag.detail),
+                    Some(diag),
+                );
             }
         };
         if envelope.is_empty() {
+            let diag = crate::diagnostic::Diagnostic::classify("");
             return base.with(
                 SimulationStatus::BuildFailed,
                 "envelope build produced no output".to_string(),
+                Some(diag),
             );
         }
 
@@ -233,6 +260,7 @@ impl SimulationResult {
                 return base.with(
                     SimulationStatus::Error,
                     format!("simulate subprocess error: {e}"),
+                    None,
                 )
             }
         };
@@ -242,30 +270,38 @@ impl SimulationResult {
             } else {
                 simulated.stderr.trim().to_string()
             };
-            let status = if detail.contains("unsupported operation type") {
-                SimulationStatus::UnsupportedOperation
-            } else {
-                SimulationStatus::SimulateFailed
-            };
-            return base.with(status, detail);
+            let diag = crate::diagnostic::Diagnostic::classify(&detail);
+            // A refused operation type keeps its own status, so existing
+            // consumers of `unsupported_operation` are unaffected.
+            let status =
+                if diag.category == crate::diagnostic::DiagnosticCategory::UnsupportedOperation {
+                    SimulationStatus::UnsupportedOperation
+                } else {
+                    SimulationStatus::SimulateFailed
+                };
+            return base.with(status, diag.detail.clone(), Some(diag));
         }
 
         let simulated_xdr = simulated.stdout.trim().to_string();
         if simulated_xdr.is_empty() {
+            let diag = crate::diagnostic::Diagnostic::classify("");
             return base.with(
                 SimulationStatus::SimulateFailed,
                 "simulate produced no output".to_string(),
+                Some(diag),
             );
         }
 
         let mut result = base.with(
             SimulationStatus::Simulated,
             "envelope simulated; not submitted".to_string(),
+            None,
         );
         result.envelope_sha256 = Some(sha256_hex(&simulated_xdr));
 
         // Step 3 — decode, best effort. A decode failure does not undo a
-        // successful simulation; it only leaves `resources` empty.
+        // successful simulation; it only leaves `resources` empty and
+        // records why.
         let decode_args: Vec<&std::ffi::OsStr> = vec![
             std::ffi::OsStr::new("tx"),
             std::ffi::OsStr::new("decode"),
@@ -280,9 +316,18 @@ impl SimulationResult {
         result
     }
 
-    fn with(mut self, status: SimulationStatus, diagnostic: String) -> Self {
+    fn with(
+        mut self,
+        status: SimulationStatus,
+        diagnostic: String,
+        diag: Option<crate::diagnostic::Diagnostic>,
+    ) -> Self {
         self.status = status;
         self.diagnostic = redact(&diagnostic);
+        if let Some(d) = diag {
+            self.diagnostic_category = Some(d.category);
+            self.remediation = Some(d.remediation);
+        }
         self
     }
 }
@@ -319,25 +364,67 @@ fn parse_decoded_resources(json: &str) -> SimulatedResources {
 
 /// Redact anything shaped like a Stellar secret seed from a diagnostic.
 ///
-/// A seed is a 56-character base32 string starting with `S`. Nothing in this
-/// toolkit passes a key to the CLI, but a CLI error could echo one back, so
-/// diagnostics are scrubbed before they reach a report.
+/// A seed is a 56-character base32 run starting with `S`. The scan looks for
+/// that shape anywhere in the text, including inside punctuation, so a seed
+/// wrapped as `(key SAAA...)` is caught.
 ///
-/// This is a defensive filter, not a guarantee: it matches the seed shape, so
-/// a seed split across whitespace or embedded in a longer token is not caught.
-/// The real protection is that no code path accepts a secret key as input.
+/// This is a defensive filter, not a guarantee. The real protection is that
+/// no code path accepts a secret key as input.
 pub fn redact(text: &str) -> String {
-    text.split_inclusive(|c: char| c.is_whitespace())
-        .map(|token| {
-            let trimmed = token.trim_end();
-            let is_seed = trimmed.len() == 56 && trimmed.starts_with('S');
-            if is_seed {
-                format!("<redacted-secret>{}", &token[trimmed.len()..])
-            } else {
-                token.to_string()
-            }
-        })
-        .collect()
+    // Scan for the seed shape anywhere in the text, not only in
+    // whitespace-delimited tokens. A seed wrapped in punctuation, e.g.
+    // `(key SAAA...)`, would otherwise survive, because the surrounding
+    // characters make the token longer than 56.
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'S' && is_seed_at(bytes, i) {
+            out.push_str("<redacted-secret>");
+            i += SEED_LEN;
+        } else {
+            // Copy one UTF-8 character, so multi-byte input is not split.
+            let ch_len = utf8_len(bytes[i]);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(&text[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Length of a Stellar secret seed: 56 base32 characters.
+const SEED_LEN: usize = 56;
+
+/// True when `bytes[start..start + SEED_LEN]` is a seed-shaped run.
+fn is_seed_at(bytes: &[u8], start: usize) -> bool {
+    if start + SEED_LEN > bytes.len() {
+        return false;
+    }
+    let window = &bytes[start..start + SEED_LEN];
+    // The character after the run must not be alphanumeric, otherwise this
+    // is a longer token that merely starts with S.
+    let after = bytes.get(start + SEED_LEN);
+    if after.is_some_and(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    window.iter().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// UTF-8 sequence length from a leading byte.
+fn utf8_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 /// Minimal SHA-256, used only to give the simulated envelope a stable id.
@@ -548,6 +635,11 @@ impl SimulationReport {
                 "  {mark}\t[{}]\t{}::{} on {}\t{}\n",
                 r.step_index, r.contract_id, r.function, r.network, r.diagnostic
             ));
+            // A classified failure gets its remediation on its own line, so
+            // the fix is visible without reading the raw CLI text.
+            if let (Some(cat), Some(fix)) = (r.diagnostic_category, &r.remediation) {
+                out.push_str(&format!("    {}\t{}\n", cat.as_str(), fix));
+            }
         }
         out
     }
@@ -639,6 +731,8 @@ mod tests {
             envelope_sha256: None,
             resources: SimulatedResources::default(),
             diagnostic: "d".into(),
+            diagnostic_category: None,
+            remediation: None,
         }
     }
 
