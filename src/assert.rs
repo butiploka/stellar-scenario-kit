@@ -262,7 +262,13 @@ impl AssertBalanceResult {
                 // "malformed JSON" hides the real error.
                 let detail = first_non_empty(&[&output.stderr, &output.stdout])
                     .unwrap_or_else(|| "<no output>".to_string());
-                let raw_diag = crate::diagnostic::Diagnostic::classify(&detail);
+                // An empty stream is `empty_output`, not `unknown`: classify("")
+                // maps to EmptyOutput, while the "<no output>" placeholder does not.
+                let raw_diag = if output.stdout.is_empty() && output.stderr.is_empty() {
+                    crate::diagnostic::Diagnostic::classify("")
+                } else {
+                    crate::diagnostic::Diagnostic::classify(&detail)
+                };
                 let diagnostic = crate::simulate::redact(&format!(
                     "stellar CLI exited with code {}: {detail}",
                     output.exit_code

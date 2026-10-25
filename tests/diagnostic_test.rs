@@ -591,6 +591,41 @@ steps:
 }
 
 #[test]
+fn assert_balance_empty_stream_nonzero_exit_is_empty_output() {
+    // When stdout and stderr are both empty on non-zero exit, the diagnostic
+    // category must be `EmptyOutput`, not `Unknown`. This guards against a
+    // regression where the "<no output>" placeholder was classified as unknown.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = fake_stellar(dir.path());
+    let scenario = dir.path().join("scenario.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: probe
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    asset: "UNRESOLVED:GBZRRHOV4GKVTXNOH7YPGGQNDPEE7JSA6R4A3HFQLXUYK2MWLBWVDAWN"
+    min_balance: "1"
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("assert")
+        .arg(scenario.to_str().unwrap())
+        .env("STELLAR_CLI", fake.to_str().unwrap())
+        .env("FAKE_BALANCE_EXIT", "1"); // exit 1, empty stdout/stderr
+    let output = cmd.output().expect("run assert");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    let res = first(&v);
+    assert_eq!(res["status"], "error");
+    assert_eq!(res["diagnostic_category"], "empty_output");
+}
+
+#[test]
 fn assert_balance_redacts_seed_in_diagnostic() {
     // A seed-shaped string must not survive into the JSON diagnostic, even
     // when it arrives inside a structured balance error message.
