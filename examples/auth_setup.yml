@@ -1,8 +1,14 @@
+# WARNING: this scenario contains a mutating step (ensure_funded).
+# `stellar-scenario assert` and `stellar-scenario simulate` skip it and
+# report the skip. Only `stellar-scenario plan` shows the command that
+# would mutate state. No command in this toolkit submits it.
+
 schema_version: "1.0"
 name: auth_setup
 description: Ensure a funded identity exists for authorization testing.
 network: testnet
 source: alice
+timeout_seconds: 120
 steps:
   - action: ensure_funded
     identity: alice

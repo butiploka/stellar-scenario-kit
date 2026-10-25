@@ -1,8 +1,14 @@
+# WARNING: this scenario contains mutating steps (ensure_funded, payment).
+# `stellar-scenario assert` and `stellar-scenario simulate` skip them and
+# report the skip. Only `stellar-scenario plan` shows the commands that
+# would mutate state. No command in this toolkit submits them.
+
 schema_version: "1.0"
 name: payment_alice_to_bob
 description: Send 100 XLM from alice to bob on testnet, then assert bob's balance.
 network: testnet
 source: alice
+timeout_seconds: 120
 steps:
   - action: ensure_funded
     identity: alice
@@ -16,4 +22,5 @@ steps:
 
   - action: assert_balance
     identity: bob
+    asset: native
     min_balance: 100

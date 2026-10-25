@@ -4,10 +4,10 @@ Local-first toolkit for defining, validating, and executing reproducible
 Stellar/Soroban development scenarios.
 
 A scenario is a versioned YAML file that describes a repeatable development
-flow — fund a test identity, send a payment, assert a balance. The kit
-validates those files, plans them against the Stellar CLI, and executes the
-read-only steps. Live transaction submission is a later milestone (see
-[Status](#status) and [Execution contract](#execution-contract)).
+flow — assert a balance, simulate a contract call, and (in a later milestone)
+send a payment. The kit validates those files, plans them against the Stellar
+CLI, and runs the read-only and simulated steps. Transaction submission is
+not implemented (see [Status](#status) and [Execution contract](#execution-contract)).
 
 No website, dashboard, hosted server, AI API, or paid service is involved.
 Everything runs locally.
@@ -30,6 +30,7 @@ Implemented:
 - Stable JSON and text output
 - Deterministic exit codes
 - Process execution adapter with timeouts and structured errors
+- JSON output contract tests pinning every command's public shape
 - Unit and integration tests with checked-in fixtures
 
 Not yet implemented (deferred deliberately):
@@ -56,8 +57,41 @@ cargo build --release
 # binary at target/release/stellar-scenario
 ```
 
-The `plan`, `assert`, and `doctor` commands locate the Stellar CLI via
-`stellar` on `PATH`, or the `STELLAR_CLI` environment variable when set.
+### Prerequisites
+
+- The Stellar CLI (`stellar`) must be on `PATH`, or `STELLAR_CLI` must point
+  at it. `validate` and `plan` work without it; `assert`, `simulate`, and
+  `doctor` need it.
+- `assert` and `simulate` contact a Stellar network over RPC. The network
+  named in the scenario must exist in `stellar network ls`. `testnet` is
+  configured by default.
+- `assert` and `simulate` read existing on-chain state. They never create
+  accounts, fund accounts, or submit transactions.
+
+Check your setup:
+
+```bash
+stellar-scenario doctor
+```
+
+## Quick start
+
+```bash
+# 1. Validate a scenario — pure local, no network
+stellar-scenario validate examples/assert_balance.yml
+
+# 2. See exactly what a run would execute — pure local, no network
+stellar-scenario plan examples/assert_balance.yml
+
+# 3. Assert a balance against the ledger — read-only RPC
+stellar-scenario assert examples/assert_balance.yml
+
+# 4. Simulate a Soroban call — read-only RPC, no submission
+stellar-scenario simulate examples/simulate_decimals.yml
+```
+
+Every command prints JSON on stdout by default and accepts `--output text`
+for a human-readable summary on stderr.
 
 ## Usage
 
@@ -558,18 +592,41 @@ Aggregation rules:
 - then `simulated` (at least one simulated, no failures or unsupported)
 - otherwise `no_simulations`
 
+### JSON shape inconsistencies
+
+Two shape differences exist today. Both are documented rather than changed,
+because changing either would break consumers of the current output.
+
+**`doctor` returns a top-level array; every other command returns an object.**
+`doctor` also has no `schema_version` field, because a bare array has nowhere
+to put one. A consumer that parses `doctor` output must handle a JSON array,
+not an object.
+
+**`schema_version` means two different things depending on the command.**
+- In `validate` output it is the *report format version* this build emits —
+  currently always `"1.0"`.
+- In `assert` and `simulate` output it is the *scenario's declared*
+  `schema_version`, echoed from the file.
+
+They are equal today only because `"1.0"` is the sole accepted scenario
+version. If the scenario schema ever moves to `"1.1"`, these two fields would
+diverge, and `validate`'s `schema_version` would still read `"1.0"`.
+
+`tests/json_contract_test.rs` pins the current behavior for all of the above,
+so any future change is deliberate rather than accidental.
+
 ## Examples
 
-- `examples/payment.yml` — fund, pay, assert balance
-- `examples/auth_setup.yml` — fund an identity for authorization testing
 - `examples/assert_balance.yml` — read-only balance assertion
 - `examples/assert_asset.yml` — existence-only asset assertion
+- `examples/payment.yml` — fund, pay, assert balance (mutating steps are skipped by `assert`/`simulate`)
+- `examples/auth_setup.yml` — fund an identity for authorization testing (mutating steps are skipped by `assert`/`simulate`)
 - `examples/simulate_invoke.yml` — simulate `balance(id)` on the native SAC
 - `examples/simulate_decimals.yml` — simulate `decimals()` (zero args, u32)
 - `examples/simulate_allowance.yml` — simulate `allowance(from, spender)` (two Address args)
 
 ```bash
-stellar-scenario validate examples/payment.yml
+stellar-scenario validate examples/assert_balance.yml
 stellar-scenario plan examples/payment.yml
 stellar-scenario assert examples/assert_balance.yml
 stellar-scenario assert examples/assert_asset.yml
@@ -601,11 +658,14 @@ src/
   runner.rs       subprocess adapter: argv, timeouts, structured errors
   stellar.rs      Stellar CLI discovery and read-only diagnostics
   assert.rs       balance/asset assertion model, execution, and reporting
+  simulate.rs     transaction simulation model, execution, and reporting
 tests/
   unit_tests.rs            parsing and validation unit tests
   integration_test.rs      validate command tests
   execution_test.rs        plan and doctor command tests
   assert_test.rs           assert command tests
+  simulate_test.rs         simulate command tests
+  json_contract_test.rs    JSON shape, status vocabulary, and exit-code contract
   scenarios/               checked-in fixtures
 examples/                  documented example scenarios
 ```
@@ -616,6 +676,14 @@ Any file under `tests/scenarios/` whose name starts with `invalid_` must fail
 validation; every other `.yml` file under `tests/scenarios/` and `examples/`
 must pass. The `fixture_integrity` test enforces this, so a broken fixture
 cannot enter the repository unnoticed.
+
+### JSON output contract
+
+`tests/json_contract_test.rs` pins the public shape of every command's JSON:
+field names, types, closed status vocabularies, and exit-code mapping. It
+also asserts that stdout is parseable JSON in json mode and empty in text
+mode, so a command can never mix the two. When changing a public field,
+update that test in the same commit.
 
 ### Testing without the Stellar CLI
 

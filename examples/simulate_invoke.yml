@@ -1,3 +1,16 @@
+# Simulates a Soroban balance read against the native Stellar Asset Contract.
+#
+# Prerequisites:
+#   - Stellar CLI on PATH (or STELLAR_CLI set)
+#   - A `testnet` network profile in `stellar network ls`
+#   - `source` must be an account that EXISTS on testnet. The native SAC
+#     always exists (deployed by the network itself), so no contract setup
+#     is needed. The account must exist on-chain or the simulation errors.
+#
+# This example is read-only. `stellar-scenario simulate` builds the envelope
+# with --build-only, simulates it, and decodes the result. Nothing is
+# submitted and no account is funded.
+
 schema_version: "1.0"
 name: simulate_native_balance
 description: Simulate a Soroban balance read against the native asset contract.
