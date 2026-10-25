@@ -305,11 +305,11 @@ fn fixture_integrity() {
     }
 
     assert!(
-        checked_valid >= 4,
-        "expected at least 4 valid fixtures, checked {checked_valid}"
+        checked_valid >= 20,
+        "expected at least 20 valid fixtures, checked {checked_valid}"
     );
     assert!(
-        checked_invalid >= 7,
-        "expected at least 7 invalid fixtures, checked {checked_invalid}"
+        checked_invalid >= 20,
+        "expected at least 20 invalid fixtures, checked {checked_invalid}"
     );
 }

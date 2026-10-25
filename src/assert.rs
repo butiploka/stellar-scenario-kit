@@ -259,7 +259,7 @@ impl AssertBalanceResult {
 }
 
 /// Return the first non-blank string, trimmed, or `None` if all are blank.
-fn first_non_empty(candidates: &[&String]) -> Option<String> {
+pub fn first_non_empty(candidates: &[&String]) -> Option<String> {
     candidates
         .iter()
         .map(|s| s.trim())

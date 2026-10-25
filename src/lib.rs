@@ -14,6 +14,7 @@
 pub mod assert;
 pub mod cli;
 pub mod error;
+pub mod inspect;
 pub mod plan;
 pub mod reporter;
 pub mod runner;

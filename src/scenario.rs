@@ -159,10 +159,11 @@ impl Scenario {
                 "assert_balance" => validate_assert_balance(step, idx, &mut issues),
                 "assert_asset" => validate_assert_asset(step, idx, &mut issues),
                 "simulate_invoke" => validate_simulate_invoke(step, idx, &mut issues),
+                "inspect_contract" => validate_inspect_contract(step, idx, &mut issues),
                 other => issues.push(ValidationIssue {
                     field,
                     message: format!(
-                        "unknown action '{other}'; supported actions: ensure_funded, payment, assert_balance, assert_asset, simulate_invoke"
+                        "unknown action '{other}'; supported actions: ensure_funded, payment, assert_balance, assert_asset, simulate_invoke, inspect_contract"
                     ),
                     line: None,
                 }),
@@ -185,6 +186,7 @@ pub enum Action {
     AssertBalance,
     AssertAsset,
     SimulateInvoke,
+    InspectContract,
 }
 
 impl Action {
@@ -197,6 +199,7 @@ impl Action {
             "assert_balance" => Some(Self::AssertBalance),
             "assert_asset" => Some(Self::AssertAsset),
             "simulate_invoke" => Some(Self::SimulateInvoke),
+            "inspect_contract" => Some(Self::InspectContract),
             _ => None,
         }
     }
@@ -274,6 +277,10 @@ fn validate_assert_asset(step: &Step, idx: usize, issues: &mut Vec<ValidationIss
             });
         }
     }
+}
+
+fn validate_inspect_contract(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
+    require_string(step, idx, "contract_id", issues);
 }
 
 fn validate_simulate_invoke(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {

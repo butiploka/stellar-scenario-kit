@@ -1,0 +1,5 @@
+schema_version: "1.0"
+name: inspect_missing_contract
+network: testnet
+steps:
+  - action: inspect_contract

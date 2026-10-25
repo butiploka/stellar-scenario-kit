@@ -1,0 +1,13 @@
+# Inspects the native Stellar Asset Contract on testnet.
+#
+# The native SAC is deployed by the network itself, so no contract setup is
+# needed. This example is read-only: it downloads the contract spec and
+# changes nothing.
+
+schema_version: "1.0"
+name: inspect_native_sac
+network: testnet
+timeout_seconds: 60
+steps:
+  - action: inspect_contract
+    contract_id: CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC

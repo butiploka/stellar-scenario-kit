@@ -63,6 +63,19 @@ pub enum Command {
         output: OutputFormat,
     },
 
+    /// Inspect one or more Soroban contract interfaces.
+    ///
+    /// Runs `stellar contract info interface --output json` for each
+    /// `inspect_contract` step and emits a structured report of functions
+    /// and events. Read-only; no transaction is built or submitted.
+    Inspect {
+        /// Path to a YAML scenario file.
+        file: PathBuf,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        output: OutputFormat,
+    },
+
     /// Report environment readiness.
     ///
     /// Checks whether the Stellar CLI is available and what it reports.

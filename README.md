@@ -402,6 +402,19 @@ would add schema surface with no concrete use case.
 | `assert_balance` | `identity`, `min_balance` | `asset` | Read only |
 | `assert_asset` | `identity` | `asset` | Read only |
 | `simulate_invoke` | `contract_id`, `function` | `source`, `args` | Read only |
+| `inspect_contract` | `contract_id` | — | Read only |
+
+### `inspect_contract` semantics
+
+- `contract_id` — the Soroban contract to inspect, as a `C...` contract id
+  or alias.
+- The command runs `stellar contract info interface --contract-id <id>
+  --network <n> --output json` and parses the `SCSpecEntry` array.
+- Only `function_v0` and `event_v0` entries are recognized. Any other spec
+  version is skipped rather than guessed at.
+- The report lists functions and events with their parameter names, types,
+  return types, and documentation strings. No transaction is built or
+  submitted.
 
 ### `simulate_invoke` semantics
 

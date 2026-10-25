@@ -190,6 +190,27 @@ fn plan_step(index: usize, step: &Step, scenario: &Scenario, executable: &str) -
                 SideEffect::ReadOnly,
             )
         }
+        "inspect_contract" => {
+            let contract_id = step
+                .params
+                .get("contract_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unset>");
+            (
+                vec![
+                    "contract".to_string(),
+                    "info".to_string(),
+                    "interface".to_string(),
+                    "--contract-id".to_string(),
+                    contract_id.to_string(),
+                    "--network".to_string(),
+                    scenario.network.clone(),
+                    "--output".to_string(),
+                    "json".to_string(),
+                ],
+                SideEffect::ReadOnly,
+            )
+        }
         "simulate_invoke" => {
             let contract_id = step
                 .params
