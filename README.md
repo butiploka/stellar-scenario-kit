@@ -479,10 +479,36 @@ Placeholders by type:
 | `string` | `<string>` |
 | `symbol` | `<symbol>` |
 | `bytes`, `bytes_n` | `<hex-bytes>` |
+| `option<T>` | `<value-or-omit>` |
 
-Container types (`vec<...>`, `map<...>`, `option<...>`) and unknown composite
-types are refused with an error naming the type, rather than emitted with a
-placeholder that cannot be filled in correctly. Write those steps by hand.
+Container types (`vec<...>`, `map<...>`) and unknown composite types are
+refused with an error naming the type and the reason, rather than emitted
+with a placeholder that cannot be filled in correctly. Write those steps
+by hand.
+
+`option<T>` is supported because the native SAC's own events use it
+(`option<string>`, `option<u64>`, `option<bytes_n<32>>`), so the rendered
+form is verified rather than guessed. `vec<...>` and `map<...>` are not
+supported because no contract available on this host's testnet identities
+exposes them, so there is no verified CLI form to generate against.
+
+### Argument format
+
+`stellar contract invoke` takes each argument as `--<name> <value>`, where
+`<value>` is JSON for every type except `Bytes` and `BytesN`, which are raw
+bytes. The CLI states this in its own help:
+
+```
+Usage Notes:
+Each arg has a corresponding --<arg_name>-file-path which is a path to a
+file containing the corresponding JSON argument.
+Note: The only types which aren't JSON are Bytes and BytesN, which are raw bytes
+```
+
+The generator emits the inline `--<name> <value>` form. For large or
+awkward values, the `--<name>-file-path` variant is the alternative; it is
+not generated because the placeholder would be a file path, which is a
+different thing to fill in.
 
 Exit codes: `0` generated, `1` function not found or unsupported argument
 type or the scenario has no usable `inspect_contract` step, `2` the

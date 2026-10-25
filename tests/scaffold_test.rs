@@ -127,6 +127,61 @@ fn scaffold_rejects_missing_function() {
 }
 
 #[test]
+fn scaffold_accepts_option_types() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = dir.path().join("stellar");
+    std::fs::write(
+        &fake,
+        r#"#!/bin/sh
+case "$1 $2 $3" in
+  "contract info interface")
+      printf '[{"function_v0":{"name":"opt_fn","inputs":[{"name":"x","type":"option<u64>"}],"outputs":[]}}]'
+      exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+    )
+    .expect("write fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).expect("stat fake").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).expect("chmod");
+    }
+
+    let scenario = dir.path().join("s.yml");
+    std::fs::write(
+        &scenario,
+        r#"schema_version: "1.0"
+name: s
+network: testnet
+steps:
+  - action: inspect_contract
+    contract_id: C
+"#,
+    )
+    .expect("write scenario");
+
+    let mut cmd = Command::new(bin());
+    cmd.arg("scaffold")
+        .arg(scenario.to_str().unwrap())
+        .arg("opt_fn")
+        .arg("--output")
+        .arg("json")
+        .env("STELLAR_CLI", fake.to_str().unwrap());
+    let output = cmd.output().expect("run scaffold");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = stdout.parse().unwrap();
+    assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("generated"));
+    assert_eq!(
+        v["args"][0]["placeholder"].as_str(),
+        Some("<value-or-omit>")
+    );
+}
+
+#[test]
 fn scaffold_rejects_unsupported_types() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = dir.path().join("stellar");

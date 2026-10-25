@@ -224,12 +224,13 @@ impl ScaffoldResult {
         let mut args = Vec::new();
         for input in &signature.inputs {
             let Some(placeholder) = placeholder_for(&input.param_type) else {
+                let reason = refusal_reason(&input.param_type)
+                    .unwrap_or("unknown type; write the step by hand");
                 return result.with(
                     ScaffoldStatus::UnsupportedType,
                     format!(
-                        "function '{function}' takes '{}' of type '{}', which this \
-                         generator does not support; write the step by hand",
-                        input.name, input.param_type
+                        "function '{function}' takes '{}' of type '{}'; {}",
+                        input.name, input.param_type, reason
                     ),
                 );
             };
@@ -289,6 +290,10 @@ impl ScaffoldResult {
 
 /// The placeholder for a Soroban type, or `None` when the type cannot be
 /// expressed as a single CLI argument.
+///
+/// Composite types arrive from `contract info interface` as rendered strings
+/// such as `option<u64>`, because `inspect::render_type` flattens the JSON
+/// type objects. This matches on that rendered form.
 fn placeholder_for(param_type: &str) -> Option<&'static str> {
     match param_type {
         "address" => Some("<address>"),
@@ -300,8 +305,44 @@ fn placeholder_for(param_type: &str) -> Option<&'static str> {
         "string" => Some("<string>"),
         "symbol" => Some("<symbol>"),
         "bytes" | "bytes_n" => Some("<hex-bytes>"),
+        // An optional argument is passed as its bare value or omitted
+        // entirely; `stellar contract invoke` takes JSON for non-bytes
+        // arguments, so `null` is the absent form. The generator emits a
+        // single placeholder either way and says so in the diagnostic.
+        other if inner_of(other, "option").is_some() => Some("<value-or-omit>"),
         _ => None,
     }
+}
+
+/// Return the inner type of a rendered `name<...>` wrapper.
+fn inner_of<'a>(rendered: &'a str, wrapper: &str) -> Option<&'a str> {
+    let prefix = format!("{wrapper}<");
+    rendered
+        .strip_prefix(prefix.as_str())
+        .and_then(|rest| rest.strip_suffix('>'))
+}
+
+/// A type the generator knows how to refuse, with the reason.
+///
+/// Naming the reason matters: "unsupported" alone leaves an author guessing
+/// whether the generator is incomplete or the type is genuinely awkward.
+fn refusal_reason(param_type: &str) -> Option<&'static str> {
+    if inner_of(param_type, "vec").is_some() {
+        return Some(
+            "list arguments are passed as a JSON array, and no verified contract \
+             was available to confirm the exact accepted form; write the step by hand",
+        );
+    }
+    if inner_of(param_type, "map").is_some() {
+        return Some(
+            "map arguments are passed as a JSON object, and no verified contract \
+             was available to confirm the exact accepted form; write the step by hand",
+        );
+    }
+    if param_type.contains('<') || param_type.contains('{') {
+        return Some("nested or unknown composite type; write the step by hand");
+    }
+    Some("unknown type; write the step by hand")
 }
 
 /// Render the step as YAML.
@@ -385,10 +426,22 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_for_supports_option() {
+        // The native SAC's events carry `option<string>`, `option<u64>`, and
+        // `option<bytes_n<32>>`, so the rendered form is real.
+        assert_eq!(placeholder_for("option<u64>"), Some("<value-or-omit>"));
+        assert_eq!(placeholder_for("option<string>"), Some("<value-or-omit>"));
+        assert_eq!(
+            placeholder_for("option<bytes_n<32>>"),
+            Some("<value-or-omit>")
+        );
+    }
+
+    #[test]
     fn placeholder_for_refuses_container_and_unknown_types() {
         for ty in [
-            "option<u64>",
             "vec<address>",
+            "vec<u32>",
             "map<address, i128>",
             "{\"udt\":{\"name\":\"Foo\"}}",
             "",
@@ -396,6 +449,32 @@ mod tests {
         ] {
             assert_eq!(placeholder_for(ty), None, "type {ty:?} must be refused");
         }
+    }
+
+    #[test]
+    fn refusal_reason_names_the_container() {
+        assert!(refusal_reason("vec<address>")
+            .unwrap()
+            .contains("JSON array"));
+        assert!(refusal_reason("map<address, i128>")
+            .unwrap()
+            .contains("JSON object"));
+        assert!(refusal_reason("{\"udt\":{\"name\":\"Foo\"}}")
+            .unwrap()
+            .contains("composite"));
+        assert!(refusal_reason("weird").unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn inner_of_extracts_wrapper_contents() {
+        assert_eq!(inner_of("option<u64>", "option"), Some("u64"));
+        assert_eq!(inner_of("vec<address>", "vec"), Some("address"));
+        assert_eq!(
+            inner_of("option<bytes_n<32>>", "option"),
+            Some("bytes_n<32>")
+        );
+        assert_eq!(inner_of("u64", "option"), None);
+        assert_eq!(inner_of("optionx<u64>", "option"), None);
     }
 
     #[test]
@@ -448,6 +527,51 @@ mod tests {
         assert_eq!(yaml_scalar("has:colon"), "\"has:colon\"");
         assert_eq!(yaml_scalar(""), "\"\"");
         assert_eq!(yaml_scalar("quote\"inside"), "\"quote\\\"inside\"");
+    }
+
+    #[test]
+    fn generated_step_with_option_arg_parses() {
+        // The placeholder must be a valid YAML string, and the resulting
+        // step must pass the real schema.
+        let args = args_of(&[("x", "option<u64>")]);
+        let step = render_step("CABC", "opt_fn", &args);
+        let scenario = format!(
+            "schema_version: \"1.0\"\nname: generated\nnetwork: testnet\nsteps:\n{}",
+            indent(&step)
+        );
+        let parsed = Scenario::from_str(&scenario)
+            .unwrap_or_else(|e| panic!("option step must validate: {e}\n{scenario}"));
+        assert_eq!(parsed.steps.len(), 1);
+        assert_eq!(
+            parsed.steps[0]
+                .params
+                .get("function")
+                .and_then(|v| v.as_str()),
+            Some("opt_fn")
+        );
+    }
+
+    #[test]
+    fn generated_step_with_mixed_types_parses() {
+        let args = args_of(&[
+            ("from", "address"),
+            ("amount", "i128"),
+            ("maybe", "option<string>"),
+            ("raw", "bytes"),
+        ]);
+        let step = render_step("CABC", "mixed", &args);
+        let scenario = format!(
+            "schema_version: \"1.0\"\nname: generated\nnetwork: testnet\nsteps:\n{}",
+            indent(&step)
+        );
+        let parsed = Scenario::from_str(&scenario)
+            .unwrap_or_else(|e| panic!("mixed step must validate: {e}\n{scenario}"));
+        let args_seq = parsed.steps[0]
+            .params
+            .get("args")
+            .and_then(|v| v.as_sequence())
+            .expect("args is a sequence");
+        assert_eq!(args_seq.len(), 8, "four flag/value pairs");
     }
 
     #[test]
