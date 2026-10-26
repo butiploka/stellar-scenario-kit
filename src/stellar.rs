@@ -373,14 +373,18 @@ mod tests {
     #[test]
     fn diagnose_emits_version_compatibility_check() {
         let results = diagnose();
-        if !results.iter().any(|d| d.name == "stellar_cli") {
-            // No CLI on this host; the check is emitted only when the CLI exists.
+        // Skip if no CLI diagnostic at all, or if the CLI was not found/functional.
+        // stellar_cli_version_ok is only emitted when the CLI exists AND responds to --version.
+        let Some(cli_diag) = results.iter().find(|d| d.name == "stellar_cli") else {
+            return;
+        };
+        if !cli_diag.ok {
             return;
         }
         let check = results
             .iter()
             .find(|d| d.name == "stellar_cli_version_ok")
-            .expect("diagnose must emit stellar_cli_version_ok when the CLI is present");
+            .expect("stellar_cli found and working; must have stellar_cli_version_ok");
         assert!(
             check.detail.contains(MINIMUM_CLI_VERSION),
             "detail must state the required floor, got {:?}",
