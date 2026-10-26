@@ -74,6 +74,11 @@ impl ValidationReport {
         s
     }
 
+    /// Serialize to a single compact JSON line (no trailing newline).
+    pub fn to_compact_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// Serialize to a compact human-readable summary.
     pub fn to_text(&self) -> String {
         let mut out = String::new();

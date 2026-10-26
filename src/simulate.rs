@@ -46,6 +46,7 @@
 //! reports that case as [`SimulationStatus::UnsupportedOperation`] rather
 //! than pretending the simulation ran.
 
+use crate::assert::jsonl_line;
 use crate::runner;
 use crate::scenario::{Scenario, Step};
 
@@ -556,6 +557,24 @@ pub enum SimulationReportStatus {
     NoSimulations,
 }
 
+/// Nested step-count summary for [`SimulationReport`].
+/// Mirrors the flat counts (`simulated`, `unsupported`, `failed`) while
+/// providing granular breakdown and explicit exclusion of skipped steps.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SimulationStepCounts {
+    /// Steps that produced a simulated envelope.
+    pub simulated: usize,
+    /// Steps refused as unsupported operation types.
+    pub unsupported: usize,
+    /// Steps that failed (BuildFailed, SimulateFailed, DecodeFailed, or Error).
+    pub failed: usize,
+    /// Steps skipped because they are not simulation steps.
+    pub skipped: usize,
+    /// Total steps (simulated + unsupported + failed + skipped).
+    pub total: usize,
+}
+
 /// Aggregate report for a simulation run.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -582,6 +601,10 @@ pub struct SimulationReport {
     pub submitted: bool,
     /// Per-step results, in step order.
     pub results: Vec<SimulationResult>,
+    /// Nested step-count summary, following [`crate::assert::AssertStepCounts`]
+    /// conventions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_counts: Option<SimulationStepCounts>,
 }
 
 impl SimulationReport {
@@ -628,6 +651,13 @@ impl SimulationReport {
             status,
             submitted: false,
             results,
+            step_counts: Some(SimulationStepCounts {
+                simulated,
+                unsupported,
+                failed,
+                skipped,
+                total: scenario.steps.len(),
+            }),
         }
     }
 
@@ -667,6 +697,28 @@ impl SimulationReport {
             if let (Some(cat), Some(fix)) = (r.diagnostic_category, &r.remediation) {
                 out.push_str(&format!("    {}\t{}\n", cat.as_str(), fix));
             }
+        }
+        out
+    }
+
+    /// Serialize to a single compact JSON object (no whitespace, one line).
+    ///
+    /// Used for the JSONL aggregate report on stderr, where a consumer reads
+    /// the whole report as one value.
+    pub fn to_compact_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Serialize the per-step event stream as JSON Lines.
+    ///
+    /// Each simulation result emits a {"type": "result", ...} object. One
+    /// compact JSON object per line, in step order, with no pretty-printing and
+    /// no surrounding prose. Simulation never submits a transaction; results
+    /// are read-only simulation outputs.
+    pub fn to_jsonl_events(&self) -> String {
+        let mut out = String::new();
+        for r in &self.results {
+            out.push_str(&jsonl_line("result", r));
         }
         out
     }
@@ -849,5 +901,234 @@ steps:
         let s = scenario_with(TWO_STEPS);
         let rep = SimulationReport::new(&s, vec![result(&s, 0, SimulationStatus::Simulated)], 1);
         assert!(rep.to_text().contains("not submitted"));
+    }
+
+    #[test]
+    fn report_step_counts_nested_and_flat() {
+        let s = scenario_with(TWO_STEPS);
+        let rep = SimulationReport::new(
+            &s,
+            vec![
+                result(&s, 0, SimulationStatus::Simulated),
+                result(&s, 1, SimulationStatus::BuildFailed),
+            ],
+            0, // both steps were simulate_invoke, so none skipped
+        );
+        assert!(rep.step_counts.is_some());
+        let sc = rep.step_counts.as_ref().unwrap();
+        assert_eq!(sc.simulated, 1);
+        assert_eq!(sc.unsupported, 0);
+        assert_eq!(sc.failed, 1); // BuildFailed falls under "failed"
+        assert_eq!(sc.skipped, 0);
+        assert_eq!(sc.total, 2); // TWO_STEPS has 2 steps
+                                 // Flat counts for backward compat
+        assert_eq!(rep.simulated, 1);
+        assert_eq!(rep.failed, 1);
+        assert_eq!(rep.skipped, 0);
+        assert_eq!(rep.total_steps, 2);
+    }
+
+    #[test]
+    fn compose_jsonl_events_single_line() {
+        let s = scenario_with(TWO_STEPS);
+        let rep = SimulationReport::new(
+            &s,
+            vec![
+                result(&s, 0, SimulationStatus::Simulated),
+                result(&s, 1, SimulationStatus::UnsupportedOperation),
+            ],
+            0,
+        );
+        let events = rep.to_jsonl_events();
+        let lines: Vec<&str> = events.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let ev: serde_json::Value = serde_json::from_str(line).expect("valid JSON per line");
+            assert_eq!(ev.get("type").and_then(|v| v.as_str()), Some("result"));
+        }
+    }
+
+    #[test]
+    fn compose_compact_json_is_single_line() {
+        let s = scenario_with(TWO_STEPS);
+        let rep = SimulationReport::new(&s, vec![result(&s, 0, SimulationStatus::Simulated)], 1);
+        let compact = rep.to_compact_json();
+        assert!(!compact.contains('\n'), "compact JSON must be single line");
+        assert!(compact.contains("\"scenario\""));
+        assert!(compact.contains("\"step_counts\""));
+    }
+
+    #[test]
+    fn jsonl_event_has_type_first() {
+        // serde_json preserves struct field order, ensuring `type` is first.
+        let s = scenario_with(TWO_STEPS);
+        let rep = SimulationReport::new(&s, vec![result(&s, 0, SimulationStatus::Simulated)], 1);
+        let events = rep.to_jsonl_events();
+        let first_line = events.lines().next().unwrap();
+        assert!(
+            first_line.starts_with("{\"type\":"),
+            "type field must be first: {first_line}"
+        );
+    }
+
+    /// Every JSONL event preserves its original SimulationStatus, and every
+    /// aggregate counter classifies that same set of results consistently.
+    /// Skipped steps are excluded from the event stream but counted in `skipped`.
+    #[test]
+    fn status_to_counter_consistency_all_variants() {
+        let raw = r#"schema_version: "1.0"
+name: status_matrix
+network: testnet
+steps:
+  - action: simulate_invoke
+    contract_id: CAAA
+    function: f
+  - action: simulate_invoke
+    contract_id: CBBB
+    function: f
+  - action: simulate_invoke
+    contract_id: CCCC
+    function: f
+  - action: simulate_invoke
+    contract_id: CDDD
+    function: f
+  - action: simulate_invoke
+    contract_id: CEEE
+    function: f
+  - action: simulate_invoke
+    contract_id: CFFF
+    function: f
+  - action: simulate_invoke
+    contract_id: CGGG
+    function: f
+"#;
+        let s = Scenario::from_str(raw).expect("scenario parses");
+        // 7 steps, all simulate_invoke → 0 skipped.
+        let statuses = [
+            SimulationStatus::Simulated,
+            SimulationStatus::UnsupportedOperation,
+            SimulationStatus::BuildFailed,
+            SimulationStatus::SimulateFailed,
+            SimulationStatus::DecodeFailed,
+            SimulationStatus::Error,
+            SimulationStatus::Simulated,
+        ];
+        let results: Vec<SimulationResult> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, st)| result(&s, i, *st))
+            .collect();
+
+        let rep = SimulationReport::new(&s, results, 0);
+        let sc = rep.step_counts.as_ref().expect("step_counts present");
+
+        // Event stream: one event per result, each with the original status.
+        let events = rep.to_jsonl_events();
+        let event_statuses: Vec<String> = events
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).expect("event is JSON");
+                assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("result"));
+                v.get("status")
+                    .and_then(|s| s.as_str())
+                    .expect("event has status")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            event_statuses,
+            vec![
+                "simulated",
+                "unsupported_operation",
+                "build_failed",
+                "simulate_failed",
+                "decode_failed",
+                "error",
+                "simulated",
+            ]
+        );
+
+        // Counters classify the same results.
+        assert_eq!(sc.simulated, 2, "only Simulated counts as simulated");
+        assert_eq!(sc.unsupported, 1, "UnsupportedOperation is its own bucket");
+        assert_eq!(
+            sc.failed, 4,
+            "build/simulate/decode failed + error all count as failed"
+        );
+        assert_eq!(sc.skipped, 0, "all steps were simulate_invoke");
+        assert_eq!(sc.total, s.steps.len(), "total equals scenario step count");
+        // Reconciliation: buckets sum to the total.
+        assert_eq!(
+            sc.simulated + sc.unsupported + sc.failed + sc.skipped,
+            sc.total
+        );
+
+        // Simulation never submits.
+        assert!(!rep.submitted);
+        for l in events.lines() {
+            let v: serde_json::Value = serde_json::from_str(l).expect("event is JSON");
+            assert_eq!(
+                v.get("submitted").and_then(|b| b.as_bool()),
+                Some(false),
+                "submitted must be false on every event"
+            );
+            assert_eq!(
+                v.get("simulated").and_then(|b| b.as_bool()),
+                Some(true),
+                "simulated must be true on every event"
+            );
+        }
+    }
+
+    /// Skipped steps (non-`simulate_invoke`) are counted in `skipped`, emit no
+    /// JSONL events, and do not overlap the other counters.
+    #[test]
+    fn skipped_steps_emit_no_events_and_count_separately() {
+        let raw = r#"schema_version: "1.0"
+name: skip_matrix
+network: testnet
+source: alice
+steps:
+  - action: simulate_invoke
+    contract_id: CAAA
+    function: f
+  - action: ensure_funded
+    identity: alice
+    min_balance: 200
+  - action: payment
+    from: alice
+    to: bob
+    amount: "1"
+    asset: native
+  - action: simulate_invoke
+    contract_id: CBBB
+    function: f
+"#;
+        let s = Scenario::from_str(raw).expect("scenario parses");
+        let results = vec![
+            result(&s, 0, SimulationStatus::Simulated),
+            result(&s, 3, SimulationStatus::UnsupportedOperation),
+        ];
+        // 2 skipped: ensure_funded + payment.
+        let rep = SimulationReport::new(&s, results, 2);
+        let sc = rep.step_counts.as_ref().expect("step_counts present");
+
+        assert_eq!(sc.simulated, 1);
+        assert_eq!(sc.unsupported, 1);
+        assert_eq!(sc.failed, 0);
+        assert_eq!(sc.skipped, 2);
+        assert_eq!(sc.total, 4);
+        assert_eq!(
+            sc.simulated + sc.unsupported + sc.failed + sc.skipped,
+            sc.total
+        );
+
+        // Only the 2 executed steps emit events — never the skipped ones.
+        let events = rep.to_jsonl_events();
+        assert_eq!(events.lines().count(), 2);
+        for l in events.lines() {
+            let v: serde_json::Value = serde_json::from_str(l).expect("event is JSON");
+            assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("result"));
+        }
     }
 }

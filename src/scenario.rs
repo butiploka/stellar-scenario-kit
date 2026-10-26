@@ -121,12 +121,51 @@ impl Scenario {
             });
         }
 
+        if let Some(src) = &self.source {
+            if src.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    field: "source".into(),
+                    message:
+                        "source must not be empty when provided; remove it to use the CLI default"
+                            .into(),
+                    line: None,
+                });
+            }
+        }
+
         if self.steps.is_empty() {
             issues.push(ValidationIssue {
                 field: "steps".into(),
                 message: "steps must contain at least one step".into(),
                 line: None,
             });
+        }
+
+        // Duplicate step labels make "the step called X" ambiguous.
+        let mut seen_labels: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for (idx, step) in self.steps.iter().enumerate() {
+            if let Some(label) = &step.label {
+                if label.trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        field: format!("steps[{idx}].label"),
+                        message: "label must not be empty when provided".into(),
+                        line: None,
+                    });
+                } else {
+                    if let Some(first) = seen_labels.get(label.as_str()) {
+                        issues.push(ValidationIssue {
+                            field: format!("steps[{idx}].label"),
+                            message: format!(
+                                "duplicate label '{label}'; first used by steps[{first}]"
+                            ),
+                            line: None,
+                        });
+                    } else {
+                        seen_labels.insert(label.as_str(), idx);
+                    }
+                }
+            }
         }
 
         if let Some(secs) = self.timeout_seconds {
@@ -280,11 +319,11 @@ fn validate_assert_asset(step: &Step, idx: usize, issues: &mut Vec<ValidationIss
 }
 
 fn validate_inspect_contract(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
-    require_string(step, idx, "contract_id", issues);
+    validate_contract_id(step, idx, issues);
 }
 
 fn validate_simulate_invoke(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
-    require_string(step, idx, "contract_id", issues);
+    validate_contract_id(step, idx, issues);
     require_string(step, idx, "function", issues);
     // `source` is optional; it falls back to the scenario-level `source`.
     if let Some(v) = step.params.get("source") {
@@ -292,6 +331,12 @@ fn validate_simulate_invoke(step: &Step, idx: usize, issues: &mut Vec<Validation
             issues.push(ValidationIssue {
                 field: format!("steps[{idx}].source"),
                 message: "source must be a string (an identity name or a G... public key)".into(),
+                line: None,
+            });
+        } else if v.as_str().unwrap_or("").trim().is_empty() {
+            issues.push(ValidationIssue {
+                field: format!("steps[{idx}].source"),
+                message: "source must not be empty when provided".into(),
                 line: None,
             });
         }
@@ -316,6 +361,73 @@ fn validate_simulate_invoke(step: &Step, idx: usize, issues: &mut Vec<Validation
             }
         }
     }
+}
+
+/// Validate the `contract_id` reference of an `inspect_contract` or
+/// `simulate_invoke` step.
+///
+/// `contract_id` is either a `C...` StrKey or an alias. Both are accepted by
+/// the Stellar CLI; anything else is a typo caught here instead of at RPC
+/// time. All independent problems are reported; nothing returns early, so a
+/// caller with a bad `contract_id` still gets diagnostics for its other
+/// fields.
+fn validate_contract_id(step: &Step, idx: usize, issues: &mut Vec<ValidationIssue>) {
+    let field = format!("steps[{idx}].contract_id");
+    match step.params.get("contract_id") {
+        None => issues.push(ValidationIssue {
+            field,
+            message: "required field 'contract_id' is missing".into(),
+            line: None,
+        }),
+        Some(v) if !v.is_string() => issues.push(ValidationIssue {
+            field,
+            message: "field 'contract_id' must be a string".into(),
+            line: None,
+        }),
+        Some(v) if v.as_str().unwrap_or("").trim().is_empty() => issues.push(ValidationIssue {
+            field,
+            message: "field 'contract_id' must not be empty".into(),
+            line: None,
+        }),
+        Some(v) => {
+            let s = v.as_str().unwrap();
+            if !is_contract_reference(s) {
+                issues.push(ValidationIssue {
+                    field,
+                    message: format!(
+                        "contract_id '{s}' is neither a C... contract StrKey (56 chars, base32) \
+                         nor a valid alias (start with a letter; letters, digits, '_' or '-')"
+                    ),
+                    line: None,
+                });
+            }
+        }
+    }
+}
+
+/// A `contract_id` is either a `C...` StrKey or an alias.
+///
+/// A StrKey contract id is `C` followed by 55 base32 characters (A–Z, 2–7),
+/// giving 56 characters total. An alias starts with a letter and contains only
+/// letters, digits, `_`, or `-`.
+fn is_contract_reference(s: &str) -> bool {
+    let s = s.trim();
+    // C... StrKey: 56 chars, base32 alphabet (A-Z, 2-7 excluding 0,1,8,9)
+    if s.len() == 56
+        && s.starts_with('C')
+        && s[1..]
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || matches!(b, b'2'..=b'7'))
+    {
+        return true;
+    }
+    // Alias: starts with letter, then letters/digits/_/'-
+    let bytes = s.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 fn require_string(step: &Step, idx: usize, key: &str, issues: &mut Vec<ValidationIssue>) {
@@ -370,4 +482,84 @@ fn line_of(raw: &str, key: &str) -> Option<usize> {
     raw.lines()
         .position(|l| l.trim_start().starts_with(&format!("{key}:")))
         .map(|p| p + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_strkey_is_valid() {
+        // Native SAC on testnet
+        assert!(is_contract_reference(
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        ));
+        // Another valid StrKey
+        assert!(is_contract_reference(
+            "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA"
+        ));
+    }
+
+    #[test]
+    fn short_strkey_is_rejected() {
+        // Too short to be a StrKey; but "CDLZ" matches the alias shape, so it
+        // is accepted as an alias rather than rejected.
+        assert!(is_contract_reference("CDLZ"));
+        // A value that matches neither shape is rejected.
+        assert!(!is_contract_reference("CDLZ!"));
+    }
+
+    #[test]
+    fn strkey_with_invalid_chars_is_rejected() {
+        // A 56-char string starting with C but containing characters outside
+        // the base32 alphabet is not a StrKey. If it still matches the alias
+        // shape it is accepted as an alias; a value matching neither is
+        // rejected outright.
+        assert!(!is_contract_reference(
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC!"
+        ));
+        // Lowercase in the body is not a valid StrKey; the string still
+        // matches the alias shape, so it is accepted as an alias.
+        assert!(is_contract_reference(
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSc"
+        ));
+        // Special characters that the alias shape forbids are rejected.
+        assert!(!is_contract_reference("CABC...DEF"));
+    }
+
+    #[test]
+    fn valid_alias_is_accepted() {
+        // Simple lowercase
+        assert!(is_contract_reference("mycontract"));
+        // With underscore
+        assert!(is_contract_reference("my_contract"));
+        // With hyphen
+        assert!(is_contract_reference("my-contract"));
+        // Mixed case
+        assert!(is_contract_reference("MyContract123"));
+    }
+
+    #[test]
+    fn alias_starting_with_digit_is_rejected() {
+        assert!(!is_contract_reference("123contract"));
+    }
+
+    #[test]
+    fn alias_with_spaces_or_special_chars_is_rejected() {
+        assert!(!is_contract_reference("my contract"));
+        assert!(!is_contract_reference("my@contract"));
+        assert!(!is_contract_reference("my.contract"));
+    }
+
+    #[test]
+    fn alias_with_underscore_or_hyphen_as_first_char_is_rejected() {
+        assert!(!is_contract_reference("_contract"));
+        assert!(!is_contract_reference("-contract"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_is_rejected() {
+        assert!(!is_contract_reference(""));
+        assert!(!is_contract_reference("   "));
+    }
 }

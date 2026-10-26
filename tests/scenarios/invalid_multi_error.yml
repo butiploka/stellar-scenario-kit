@@ -1,0 +1,17 @@
+schema_version: "1.0"
+name: multi_error
+network: ""
+
+source: "  "
+
+steps:
+  - action: assert_balance
+    identity: ""
+  - action: payment
+    from: alice
+  - action: simulate_invoke
+    contract_id: ""
+    function: ""
+  - action: assert_balance
+    identity: alice
+    min_balance: "abc"

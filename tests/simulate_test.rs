@@ -440,3 +440,121 @@ steps:
     assert_eq!(status, "build_failed");
     assert_eq!(output.status.code(), Some(2));
 }
+
+// -------------------------------------------------- JSONL output tests
+
+#[test]
+fn simulate_jsonl_invalid_scenario_empty_stdout_stderr_aggregate() {
+    let output = simulate_cmd(&fixture("invalid_simulate_missing_contract.yml"))
+        .arg("--output")
+        .arg("jsonl")
+        .output()
+        .expect("run simulate --output jsonl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+
+    // stdout must be empty (no step events, scenario never parsed)
+    assert!(
+        lines.is_empty(),
+        "stdout must be empty for invalid scenario, got: {stdout:?}"
+    );
+
+    // stderr must contain compact JSON error report
+    assert!(
+        !stderr.trim().is_empty(),
+        "stderr must contain aggregate error, got: {stderr:?}"
+    );
+    let stderr_json: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr is valid compact JSON");
+    assert_eq!(
+        stderr_json.get("result").and_then(|v| v.as_str()),
+        Some("invalid")
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn simulate_json_default_backward_compat() {
+    // --output json still produces pretty-printed output to stdout
+    if !stellar_available() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    let output = simulate_cmd(&fixture("valid_simulate_invoke.yml"))
+        .arg("--output")
+        .arg("json")
+        .output()
+        .expect("run simulate --output json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = stdout.parse().expect("stdout is valid JSON");
+
+    // No type discriminator in json mode
+    assert!(!stdout.contains("\"type\": \"result\""));
+    // Has step_counts
+    assert!(
+        parsed.get("step_counts").is_some(),
+        "json output should have step_counts"
+    );
+    assert!(
+        parsed.get("results").is_some(),
+        "json output should have results"
+    );
+}
+
+#[test]
+fn simulate_jsonl_live_event_stream_and_stderr_aggregate() {
+    if !stellar_runnable() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    let output = simulate_cmd(&fixture("valid_simulate_invoke.yml"))
+        .arg("--output")
+        .arg("jsonl")
+        .output()
+        .expect("run simulate --output jsonl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // stdout: one JSON line per result, with type discriminator
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "stdout must have at least one JSONL event, got: {stdout:?}"
+    );
+    for line in &lines {
+        let ev: serde_json::Value =
+            serde_json::from_str(line).expect("stdout line must be valid JSON");
+        assert_eq!(
+            ev.get("type").and_then(|v| v.as_str()),
+            Some("result"),
+            "event must have type='result': {ev}"
+        );
+        // Must have execution status; should be "simulated" for valid scenario
+        assert!(
+            ev.get("status").is_some(),
+            "event must have status field: {ev}"
+        );
+    }
+
+    // stderr: compact aggregate with step_counts
+    let stderr_parsed: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr is valid JSON");
+    assert!(
+        stderr_parsed.get("step_counts").is_some(),
+        "stderr must have step_counts: {stderr_parsed}"
+    );
+    let sc = stderr_parsed.get("step_counts").unwrap();
+    assert!(sc.get("total").is_some());
+    assert!(sc.get("simulated").is_some());
+    assert!(sc.get("skipped").is_some());
+    assert!(sc.get("failed").is_some());
+    assert!(sc.get("unsupported").is_some());
+
+    assert_eq!(output.status.code(), Some(0));
+}

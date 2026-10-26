@@ -110,6 +110,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     Json,
+    Jsonl,
     Text,
 }
 
@@ -117,6 +118,7 @@ impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Json => write!(f, "json"),
+            Self::Jsonl => write!(f, "jsonl"),
             Self::Text => write!(f, "text"),
         }
     }

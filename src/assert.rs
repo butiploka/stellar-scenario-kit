@@ -80,6 +80,12 @@ pub struct AssertBalanceResult {
     /// The remediation for [`Self::diagnostic_category`], when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remediation: Option<String>,
+    /// Whether this step was executed. Always `executable` for results that
+    /// ran; blocked steps appear in `skipped` instead.
+    pub execution_status: crate::plan::ExecutionStatus,
+    /// When the step was blocked, the reason. `None` for executed steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
 }
 
 /// Outcome of a balance assertion.
@@ -191,6 +197,8 @@ impl<'a> AssertCtx<'a> {
             diagnostic: crate::simulate::redact(diagnostic),
             diagnostic_category: category,
             remediation,
+            execution_status: crate::plan::ExecutionStatus::Executable,
+            block_reason: None,
         }
     }
 
@@ -209,6 +217,8 @@ impl<'a> AssertCtx<'a> {
             diagnostic: crate::simulate::redact(diagnostic),
             diagnostic_category: None,
             remediation: None,
+            execution_status: crate::plan::ExecutionStatus::Executable,
+            block_reason: None,
         }
     }
 }
@@ -450,16 +460,44 @@ pub struct ScenarioReport {
     pub failed: usize,
     /// Assertions that errored.
     pub errors: usize,
+    /// Assertions that were actually executed (passed + failed + errored).
+    pub executed: usize,
     /// Steps skipped because they would mutate remote state.
     pub skipped_mutating: usize,
     /// Steps skipped because they are read-only but not yet executable.
     pub skipped_not_executable: usize,
     /// Overall status.
     pub status: ScenarioStatus,
+    /// Nested, structured summary of step counts. Mirrors the flat counts
+    /// above in a single object for CI consumers.
+    ///
+    /// Semantics:
+    /// - `executed = passed + failed + errors`
+    /// - `skipped = skipped_mutating + skipped_not_executable`
+    /// - `total = executed + skipped`
+    pub step_counts: AssertStepCounts,
     /// Per-step assertion results, in step order.
     pub results: Vec<AssertBalanceResult>,
     /// Per-step skip records, in step order.
     pub skipped: Vec<SkippedStep>,
+}
+
+/// Nested step-count summary for [`ScenarioReport`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AssertStepCounts {
+    /// Steps that were executed (passed + failed + errored).
+    pub executed: usize,
+    /// Executed assertions that passed.
+    pub passed: usize,
+    /// Executed assertions that failed.
+    pub failed: usize,
+    /// Executed assertions that errored.
+    pub errors: usize,
+    /// Steps skipped (would_mutate + not_executable).
+    pub skipped: usize,
+    /// Total steps (executed + skipped).
+    pub total: usize,
 }
 
 /// A step that was not executed.
@@ -472,6 +510,14 @@ pub struct SkippedStep {
     pub action: String,
     /// Why the step was skipped.
     pub reason: SkipReason,
+    /// Execution status of the skipped step. `would_mutate` for mutating
+    /// steps; `executable` for read-only steps skipped because `assert`
+    /// has no executor for them.
+    pub execution_status: crate::plan::ExecutionStatus,
+    /// When the step was blocked, the reason. `None` for read-only steps
+    /// skipped for lack of an executor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
 }
 
 /// Why a step was not executed.
@@ -482,6 +528,26 @@ pub enum SkipReason {
     WouldMutate,
     /// The step is read-only but has no executor yet.
     NotExecutable,
+}
+
+/// Wrap a result or skip record with a `"type"` discriminator for the JSONL
+/// event stream. `type` is emitted first; the inner record's fields follow.
+#[derive(serde::Serialize)]
+pub(crate) struct JsonlEvent<'a, T: serde::Serialize> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    #[serde(flatten)]
+    inner: &'a T,
+}
+
+/// Render one JSONL line: the event's `type` discriminator plus the record's
+/// fields, compact (no whitespace), terminated with a newline.
+pub(crate) fn jsonl_line<T: serde::Serialize>(event_type: &'static str, value: &T) -> String {
+    let event = JsonlEvent {
+        event_type,
+        inner: value,
+    };
+    serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
 
 impl ScenarioReport {
@@ -531,6 +597,9 @@ impl ScenarioReport {
             ScenarioStatus::NoAssertions
         };
 
+        let executed = passed + failed + errors;
+        let skipped_total = skipped_mutating + skipped_not_executable;
+
         Self {
             scenario: scenario.name.clone(),
             schema_version: scenario.schema_version.clone(),
@@ -539,9 +608,18 @@ impl ScenarioReport {
             passed,
             failed,
             errors,
+            executed,
             skipped_mutating,
             skipped_not_executable,
             status,
+            step_counts: AssertStepCounts {
+                executed,
+                passed,
+                failed,
+                errors,
+                skipped: skipped_total,
+                total: executed + skipped_total,
+            },
             results,
             skipped,
         }
@@ -554,15 +632,55 @@ impl ScenarioReport {
         s
     }
 
+    /// Serialize to a single compact JSON object (no whitespace, one line).
+    ///
+    /// Used for the JSONL aggregate report on stderr, where a consumer reads
+    /// the whole report as one value.
+    pub fn to_compact_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Serialize the per-step event stream as JSON Lines.
+    ///
+    /// Each executed assertion emits a `{"type": "result", ...}` object; each
+    /// skipped step emits `{"type": "skipped", ...}`. Fields are the same as
+    /// the corresponding result/skip records. One compact JSON object per
+    /// line, in step order, with no pretty-printing and no surrounding prose.
+    pub fn to_jsonl_events(&self) -> String {
+        // Merge `results` and `skipped` into a single stream ordered by
+        // `step_index`. Both vectors are already individually in step order,
+        // so a simple merge preserves the scenario's ordering across both
+        // executed and skipped steps.
+        let mut r = self.results.iter().peekable();
+        let mut s = self.skipped.iter().peekable();
+        let mut out = String::new();
+        loop {
+            match (r.peek(), s.peek()) {
+                (Some(rr), Some(ss)) => {
+                    if rr.step_index <= ss.step_index {
+                        out.push_str(&jsonl_line("result", r.next().unwrap()));
+                    } else {
+                        out.push_str(&jsonl_line("skipped", s.next().unwrap()));
+                    }
+                }
+                (Some(_), None) => out.push_str(&jsonl_line("result", r.next().unwrap())),
+                (None, Some(_)) => out.push_str(&jsonl_line("skipped", s.next().unwrap())),
+                (None, None) => break,
+            }
+        }
+        out
+    }
+
     /// Render a human-readable summary.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "{} on {}: {} ({} step(s), {} passed, {} failed, {} error(s), {} skipped)\n",
+            "{} on {}: {} ({} step(s), {} executed, {} passed, {} failed, {} error(s), {} skipped)\n",
             self.scenario,
             self.network,
             status_label(self.status),
             self.total_steps,
+            self.executed,
             self.passed,
             self.failed,
             self.errors,
@@ -584,10 +702,16 @@ impl ScenarioReport {
                 SkipReason::WouldMutate => "would mutate remote state",
                 SkipReason::NotExecutable => "no executor yet",
             };
-            out.push_str(&format!(
-                "  SKIP\t[{}]\t{}\t{}\n",
-                s.step_index, s.action, reason
-            ));
+            match &s.block_reason {
+                Some(br) => out.push_str(&format!(
+                    "  SKIP\t[{}]\t{}\t{}\t({})\n",
+                    s.step_index, s.action, reason, br
+                )),
+                None => out.push_str(&format!(
+                    "  SKIP\t[{}]\t{}\t{}\n",
+                    s.step_index, s.action, reason
+                )),
+            }
         }
         out
     }
@@ -605,6 +729,7 @@ fn status_label(status: ScenarioStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::ExecutionStatus;
 
     #[test]
     fn parse_success_json() {
@@ -812,6 +937,26 @@ steps:
         Scenario::from_str(raw).unwrap()
     }
 
+    /// Build a `SkippedStep` the same way `main.rs` does: a mutating step is
+    /// `would_mutate` with a block reason; a read-only step without an
+    /// executor is `executable` and not blocked.
+    fn skipped(idx: usize, action: &str, reason: SkipReason) -> SkippedStep {
+        let (execution_status, block_reason) = match reason {
+            SkipReason::WouldMutate => (
+                ExecutionStatus::WouldMutate,
+                Some("would mutate ledger state; blocked in plan mode".to_string()),
+            ),
+            SkipReason::NotExecutable => (ExecutionStatus::Executable, None),
+        };
+        SkippedStep {
+            step_index: idx,
+            action: action.into(),
+            reason,
+            execution_status,
+            block_reason,
+        }
+    }
+
     fn result(
         scenario: &Scenario,
         idx: usize,
@@ -838,6 +983,8 @@ steps:
             diagnostic: "d".into(),
             diagnostic_category: None,
             remediation: None,
+            execution_status: crate::plan::ExecutionStatus::Executable,
+            block_reason: None,
         }
     }
 
@@ -966,16 +1113,8 @@ steps:
 "#,
         );
         let skipped = vec![
-            SkippedStep {
-                step_index: 0,
-                action: "ensure_funded".into(),
-                reason: SkipReason::WouldMutate,
-            },
-            SkippedStep {
-                step_index: 1,
-                action: "payment".into(),
-                reason: SkipReason::WouldMutate,
-            },
+            skipped(0, "ensure_funded", SkipReason::WouldMutate),
+            skipped(1, "payment", SkipReason::WouldMutate),
         ];
         let rep = ScenarioReport::new(&s, vec![], skipped);
         assert_eq!(rep.status, ScenarioStatus::NoAssertions);
@@ -997,11 +1136,7 @@ steps:
         let rep = ScenarioReport::new(
             &s,
             vec![],
-            vec![SkippedStep {
-                step_index: 0,
-                action: "ensure_funded".into(),
-                reason: SkipReason::WouldMutate,
-            }],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
         );
         assert_eq!(rep.status, ScenarioStatus::NoAssertions);
     }
@@ -1055,11 +1190,7 @@ steps:
         let rep = ScenarioReport::new(
             &s,
             vec![],
-            vec![SkippedStep {
-                step_index: 0,
-                action: "ensure_funded".into(),
-                reason: SkipReason::WouldMutate,
-            }],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
         );
         let text = rep.to_text();
         assert!(text.contains("SKIP"));
@@ -1101,5 +1232,482 @@ steps:
         assert_eq!(r.status, AssertStatus::Pass);
         assert!(r.expected_min_balance.is_none());
         assert_eq!(r.actual_balance.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn executed_result_has_executable_status() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+        );
+        let r = AssertCtx::from_step(&s, 0, &s.steps[0]).pass("5", "1");
+        assert_eq!(r.execution_status, ExecutionStatus::Executable);
+        assert_eq!(r.block_reason, None);
+    }
+
+    #[test]
+    fn skipped_mutating_step_has_would_mutate_status() {
+        let skipped = skipped(0, "ensure_funded", SkipReason::WouldMutate);
+        assert_eq!(skipped.execution_status, ExecutionStatus::WouldMutate);
+        assert!(skipped
+            .block_reason
+            .as_deref()
+            .unwrap()
+            .contains("would mutate ledger state"));
+    }
+
+    #[test]
+    fn skipped_not_executable_has_executable_status_no_block_reason() {
+        let skipped = skipped(0, "inspect_contract", SkipReason::NotExecutable);
+        assert_eq!(skipped.execution_status, ExecutionStatus::Executable);
+        assert_eq!(skipped.block_reason, None);
+    }
+
+    #[test]
+    fn json_output_includes_execution_status_and_block_reason() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                1,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
+        );
+        let json = rep.to_json();
+        // Executed result: execution_status executable, block_reason absent
+        assert!(json.contains("\"execution_status\": \"executable\""));
+        // Blocked step: execution_status would_mutate, block_reason present
+        assert!(json.contains("\"execution_status\": \"would_mutate\""));
+        assert!(json.contains("would mutate ledger state"));
+        // executed count present
+        assert!(json.contains("\"executed\": 1"));
+    }
+
+    #[test]
+    fn text_output_shows_executed_count_and_block_reason() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                1,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
+        );
+        let text = rep.to_text();
+        assert!(text.contains("1 executed"));
+        assert!(text.contains("blocked in plan mode"));
+    }
+
+    #[test]
+    fn step_counts_all_pass() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![
+                result(
+                    &s,
+                    0,
+                    "assert_balance",
+                    AssertionMode::MinBalance,
+                    AssertStatus::Pass,
+                    Some("5"),
+                ),
+                result(
+                    &s,
+                    1,
+                    "assert_balance",
+                    AssertionMode::MinBalance,
+                    AssertStatus::Pass,
+                    Some("9"),
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(rep.step_counts.executed, 2);
+        assert_eq!(rep.step_counts.passed, 2);
+        assert_eq!(rep.step_counts.failed, 0);
+        assert_eq!(rep.step_counts.errors, 0);
+        assert_eq!(rep.step_counts.skipped, 0);
+        assert_eq!(rep.step_counts.total, 2);
+    }
+
+    #[test]
+    fn step_counts_mixed_pass_fail_and_skips() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+  - action: assert_asset
+    identity: charlie
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![
+                result(
+                    &s,
+                    1,
+                    "assert_balance",
+                    AssertionMode::MinBalance,
+                    AssertStatus::Fail,
+                    Some("0"),
+                ),
+                result(
+                    &s,
+                    2,
+                    "assert_asset",
+                    AssertionMode::Exists,
+                    AssertStatus::Pass,
+                    Some("1"),
+                ),
+            ],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
+        );
+        let sc = &rep.step_counts;
+        assert_eq!(sc.executed, 2);
+        assert_eq!(sc.passed, 1);
+        assert_eq!(sc.failed, 1);
+        assert_eq!(sc.errors, 0);
+        assert_eq!(sc.skipped, 1);
+        assert_eq!(sc.total, 3);
+        // Equations hold
+        assert_eq!(sc.executed, sc.passed + sc.failed + sc.errors);
+        assert_eq!(sc.total, sc.executed + sc.skipped);
+    }
+
+    #[test]
+    fn step_counts_with_errors_and_non_executable_skips() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+  - action: inspect_contract
+    contract_id: test_contract
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Error,
+                None,
+            )],
+            vec![skipped(1, "inspect_contract", SkipReason::NotExecutable)],
+        );
+        let sc = &rep.step_counts;
+        assert_eq!(sc.executed, 1);
+        assert_eq!(sc.passed, 0);
+        assert_eq!(sc.failed, 0);
+        assert_eq!(sc.errors, 1);
+        assert_eq!(sc.skipped, 1);
+        assert_eq!(sc.total, 2);
+        assert_eq!(sc.executed, sc.passed + sc.failed + sc.errors);
+        assert_eq!(sc.total, sc.executed + sc.skipped);
+    }
+
+    #[test]
+    fn step_counts_zero_when_all_skipped() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
+        );
+        let sc = &rep.step_counts;
+        assert_eq!(sc.executed, 0);
+        assert_eq!(sc.passed, 0);
+        assert_eq!(sc.failed, 0);
+        assert_eq!(sc.errors, 0);
+        assert_eq!(sc.skipped, 1);
+        assert_eq!(sc.total, 1);
+        assert_eq!(sc.total, sc.executed + sc.skipped);
+    }
+
+    #[test]
+    fn json_includes_step_counts_and_preserves_flat_fields() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![],
+        );
+        let json = rep.to_json();
+        // Nested step_counts present
+        assert!(json.contains("\"step_counts\""), "missing step_counts");
+        assert!(json.contains("\"executed\": 1"));
+        assert!(json.contains("\"passed\": 1"));
+        assert!(json.contains("\"failed\": 0"));
+        assert!(json.contains("\"errors\": 0"));
+        assert!(json.contains("\"skipped\": 0"));
+        assert!(json.contains("\"total\": 1"));
+        // Flat fields still present (backward compat)
+        assert!(json.contains("\"passed\": 1"), "missing flat passed");
+        assert!(json.contains("\"failed\": 0"), "missing flat failed");
+        assert!(json.contains("\"errors\": 0"), "missing flat errors");
+        assert!(json.contains("\"executed\": 1"), "missing flat executed");
+        assert!(
+            json.contains("\"skipped_mutating\": 0"),
+            "missing flat skipped_mutating"
+        );
+        assert!(
+            json.contains("\"skipped_not_executable\": 0"),
+            "missing flat skipped_not_executable"
+        );
+        assert!(
+            json.contains("\"total_steps\": 1"),
+            "missing flat total_steps"
+        );
+    }
+
+    #[test]
+    fn jsonl_events_have_type_discriminator_and_parse() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+  - action: assert_balance
+    identity: bob
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                1,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![skipped(0, "ensure_funded", SkipReason::WouldMutate)],
+        );
+        let jsonl = rep.to_jsonl_events();
+        let lines: Vec<&str> = jsonl.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 event lines, got {lines:?}");
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+            .collect();
+        // Events in step order: step 0 is skipped (ensure_funded), step 1 is result.
+        let indices: Vec<u64> = parsed
+            .iter()
+            .map(|v| v.get("step_index").and_then(|s| s.as_u64()).unwrap())
+            .collect();
+        assert_eq!(indices, vec![0, 1]);
+        // Step 0: skipped event.
+        assert_eq!(
+            parsed[0].get("type").and_then(|v| v.as_str()),
+            Some("skipped")
+        );
+        assert_eq!(
+            parsed[0].get("step_index").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        // Step 1: result event.
+        assert_eq!(
+            parsed[1].get("type").and_then(|v| v.as_str()),
+            Some("result")
+        );
+        assert_eq!(
+            parsed[1].get("step_index").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            parsed[1].get("execution_status").and_then(|v| v.as_str()),
+            Some("executable")
+        );
+        assert_eq!(
+            parsed[1].get("status").and_then(|v| v.as_str()),
+            Some("pass")
+        );
+        // Step 0: skipped with would_mutate + block_reason.
+        assert_eq!(
+            parsed[0].get("type").and_then(|v| v.as_str()),
+            Some("skipped")
+        );
+        assert_eq!(
+            parsed[0].get("execution_status").and_then(|v| v.as_str()),
+            Some("would_mutate")
+        );
+        assert!(parsed[0]
+            .get("block_reason")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains("would mutate ledger state"));
+    }
+
+    #[test]
+    fn compact_json_is_single_line() {
+        let s = scenario_with(
+            r#"schema_version: "1.0"
+name: x
+network: testnet
+steps:
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"#,
+        );
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                0,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![],
+        );
+        let compact = rep.to_compact_json();
+        assert!(
+            !compact.contains('\n'),
+            "compact JSON must not contain newlines"
+        );
+        assert!(compact.contains("\"step_counts\""))
+    }
+
+    #[test]
+    fn jsonl_events_emit_in_step_order() {
+        // Step 0: ensure_funded (mutating → skipped)
+        // Step 1: payment (mutating → skipped)
+        // Step 2: assert_balance (read-only → result)
+        // Events must be emitted in step order: 0 (skipped), 1 (skipped), 2 (result).
+        let s = scenario_with(
+            r##"schema_version: "1.0"
+name: order_test
+network: testnet
+steps:
+  - action: ensure_funded
+    identity: alice
+    min_balance: 1
+  - action: payment
+    from: alice
+    to: bob
+    amount: "1"
+    asset: native
+  - action: assert_balance
+    identity: alice
+    min_balance: "1"
+"##,
+        );
+
+        let rep = ScenarioReport::new(
+            &s,
+            vec![result(
+                &s,
+                2,
+                "assert_balance",
+                AssertionMode::MinBalance,
+                AssertStatus::Pass,
+                Some("5"),
+            )],
+            vec![
+                skipped(0, "ensure_funded", SkipReason::WouldMutate),
+                skipped(1, "payment", SkipReason::WouldMutate),
+            ],
+        );
+        let events = rep.to_jsonl_events();
+        let indices: Vec<usize> = events
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v.get("step_index").and_then(|s| s.as_u64()).unwrap() as usize
+            })
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2], "events must be in step order");
     }
 }

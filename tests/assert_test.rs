@@ -156,6 +156,42 @@ fn assert_skips_mutating_steps() {
         results[0].get("step_index").and_then(|v| v.as_u64()),
         Some(2)
     );
+
+    // Each skipped (mutation-blocked) step carries an explicit
+    // execution_status and a block_reason, distinct from executed results.
+    for s in skipped {
+        assert!(
+            s.get("execution_status").is_some(),
+            "skipped step lacks execution_status: {s:?}"
+        );
+    }
+    let mutating = skipped
+        .iter()
+        .find(|s| s.get("action").and_then(|v| v.as_str()) == Some("ensure_funded"));
+    assert!(mutating.is_some(), "missing ensure_funded skip");
+    let m = mutating.unwrap();
+    assert_eq!(
+        m.get("execution_status").and_then(|v| v.as_str()),
+        Some("would_mutate")
+    );
+    assert!(m
+        .get("block_reason")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .contains("would mutate ledger state"));
+
+    // Executed results carry execution_status = executable, no block_reason.
+    for r in results {
+        assert_eq!(
+            r.get("execution_status").and_then(|v| v.as_str()),
+            Some("executable"),
+            "executed result should be executable: {r:?}"
+        );
+        assert!(
+            r.get("block_reason").is_none(),
+            "executed result should have no block_reason: {r:?}"
+        );
+    }
 }
 
 #[test]
@@ -468,6 +504,8 @@ steps:
             diagnostic: "balance 0 < expected 1".into(),
             diagnostic_category: None,
             remediation: None,
+            execution_status: stellar_scenario::plan::ExecutionStatus::Executable,
+            block_reason: None,
         },
         AssertBalanceResult {
             scenario: s.name.clone(),
@@ -483,6 +521,8 @@ steps:
             diagnostic: "timeout".into(),
             diagnostic_category: None,
             remediation: None,
+            execution_status: stellar_scenario::plan::ExecutionStatus::Executable,
+            block_reason: None,
         },
     ];
     let rep = ScenarioReport::new(&s, results, vec![]);
@@ -514,6 +554,8 @@ steps:
             step_index: 0,
             action: "ensure_funded".into(),
             reason: SkipReason::WouldMutate,
+            execution_status: stellar_scenario::plan::ExecutionStatus::WouldMutate,
+            block_reason: Some("would mutate ledger state; blocked in plan mode".to_string()),
         }],
     );
     assert_eq!(rep.status, ScenarioStatus::NoAssertions);
@@ -553,6 +595,8 @@ steps:
             diagnostic: "ok".into(),
             diagnostic_category: None,
             remediation: None,
+            execution_status: stellar_scenario::plan::ExecutionStatus::Executable,
+            block_reason: None,
         }],
         vec![],
     );
@@ -600,11 +644,15 @@ steps:
             diagnostic: "balance 0 < expected 1".into(),
             diagnostic_category: None,
             remediation: None,
+            execution_status: stellar_scenario::plan::ExecutionStatus::Executable,
+            block_reason: None,
         }],
         vec![SkippedStep {
             step_index: 0,
             action: "ensure_funded".into(),
             reason: SkipReason::WouldMutate,
+            execution_status: stellar_scenario::plan::ExecutionStatus::WouldMutate,
+            block_reason: Some("would mutate ledger state; blocked in plan mode".to_string()),
         }],
     );
     let text = rep.to_text();
@@ -612,4 +660,172 @@ steps:
     assert!(text.contains("FAIL"));
     assert!(text.contains("SKIP"));
     assert!(text.contains("ensure_funded"));
+}
+
+// ------------------------------------------------------- JSONL output tests
+
+#[test]
+fn assert_jsonl_stdout_event_stream_and_stderr_aggregate() {
+    if !stellar_available() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    let payment = project_root().join("examples/payment.yml");
+    let output = assert_cmd(payment.to_str().unwrap())
+        .arg("--output")
+        .arg("jsonl")
+        .output()
+        .expect("run assert --output jsonl");
+
+    // stdout: one JSON object per line, no surrounding prose.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "expected at least one JSONL event line, got: {stdout:?}"
+    );
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| {
+            serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("stdout line not valid JSON ({e}): {l}"))
+        })
+        .collect();
+
+    // Every event carries a type discriminator.
+    for ev in &events {
+        let t = ev.get("type").and_then(|v| v.as_str());
+        assert!(
+            t == Some("result") || t == Some("skipped"),
+            "event missing type discriminator: {ev:?}"
+        );
+    }
+
+    // Result events preserve status and execution_status.
+    let result_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("result"))
+        .collect();
+    assert!(
+        !result_events.is_empty(),
+        "expected at least one result event"
+    );
+    for ev in &result_events {
+        assert!(
+            ev.get("execution_status").is_some(),
+            "result event missing execution_status: {ev:?}"
+        );
+        assert!(
+            ev.get("status").is_some(),
+            "result event missing status: {ev:?}"
+        );
+    }
+
+    // Skipped events preserve execution_status and block_reason.
+    let skip_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("skipped"))
+        .collect();
+    assert!(
+        !skip_events.is_empty(),
+        "expected at least one skipped event"
+    );
+    for ev in &skip_events {
+        assert!(
+            ev.get("execution_status").is_some(),
+            "skipped event missing execution_status: {ev:?}"
+        );
+        assert!(
+            ev.get("block_reason").is_some(),
+            "mutating skipped event missing block_reason: {ev:?}"
+        );
+    }
+
+    // stderr: compact aggregate JSON with step_counts.
+    assert!(
+        !stderr.trim().is_empty(),
+        "expected stderr aggregate report, got: {stderr:?}"
+    );
+    let aggregate: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr aggregate is valid JSON");
+    assert!(
+        aggregate.get("step_counts").is_some(),
+        "aggregate missing step_counts: {aggregate:?}"
+    );
+    assert!(
+        aggregate.get("results").is_some(),
+        "aggregate missing results: {aggregate:?}"
+    );
+    assert!(
+        aggregate.get("skipped").is_some(),
+        "aggregate missing skipped: {aggregate:?}"
+    );
+
+    // Exit codes unchanged: payment.yml has a failing assertion (invalid
+    // address), so exit 2 (errored) is expected.
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn assert_jsonl_rejects_invalid_scenario_cleanly() {
+    // A scenario that never parses produces no step events. stdout must stay
+    // empty (the machine-readable event stream), and the error report goes to
+    // stderr as a compact JSON object.
+    let output = assert_cmd(&fixture("invalid_assert_missing_min_balance.yml"))
+        .arg("--output")
+        .arg("jsonl")
+        .output()
+        .expect("run assert --output jsonl");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty on validation failure, got: {stdout:?}"
+    );
+    let aggregate: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr report is valid JSON");
+    assert_eq!(
+        aggregate.get("result").and_then(|v| v.as_str()),
+        Some("invalid")
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn assert_json_and_text_output_unchanged() {
+    // Backward compatibility: --output json and --output text produce their
+    // original output streams (no JSONL event type discriminator).
+    if !stellar_available() {
+        eprintln!("skipping: stellar CLI not available on this host");
+        return;
+    }
+
+    let payment = project_root().join("examples/payment.yml");
+    let json_out = assert_cmd(payment.to_str().unwrap())
+        .output()
+        .expect("run assert --output json (default)");
+    let stdout = String::from_utf8_lossy(&json_out.stdout);
+    assert!(
+        !stdout.contains("\"type\": \"result\""),
+        "json output must not contain JSONL type discriminator"
+    );
+    assert!(
+        stdout.contains("\"step_counts\""),
+        "json output keeps aggregate step_counts"
+    );
+
+    let text_out = assert_cmd(payment.to_str().unwrap())
+        .arg("--output")
+        .arg("text")
+        .output()
+        .expect("run assert --output text");
+    assert!(
+        String::from_utf8_lossy(&text_out.stdout).trim().is_empty(),
+        "text output goes to stderr, not stdout"
+    );
+    assert!(!String::from_utf8_lossy(&text_out.stderr).trim().is_empty());
 }

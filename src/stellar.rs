@@ -10,6 +10,13 @@ use std::time::Duration;
 
 use crate::runner::{self, CommandOutput, RunnerError};
 
+/// The oldest `stellar` CLI release this toolkit was verified against.
+///
+/// Every diagnostic matcher, envelope shape, and JSON error `type` in this
+/// crate was reproduced against this release. A newer CLI is expected to keep
+/// working; an older one is not, and `doctor` reports it.
+pub const MINIMUM_CLI_VERSION: &str = "28.1.0";
+
 /// Errors produced by the Stellar CLI adapter.
 #[derive(Debug, thiserror::Error)]
 pub enum StellarError {
@@ -118,6 +125,61 @@ pub struct Diagnostic {
     pub detail: String,
 }
 
+/// Extract a `MAJOR.MINOR.PATCH` version from a `stellar --version` line.
+///
+/// The CLI prints e.g. `stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)`.
+/// Returns the first token that looks like a dotted triplet, optionally with a
+/// hyphenated pre-release suffix (`28.1.0-rc1`). Returns `None` when no token
+/// matches.
+pub fn extract_version(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        // Skip leading non-digits so "(v28.1.0)" also resolves.
+        let candidate = token.trim_start_matches(|c: char| !c.is_ascii_digit());
+        if candidate.is_empty() {
+            continue;
+        }
+        // The numeric core must be exactly N.N.N.
+        let core = candidate.split('-').next().unwrap_or(candidate);
+        if core.chars().filter(|&c| c == '.').count() != 2 {
+            continue;
+        }
+        if !core.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            continue;
+        }
+        // Any pre-release suffix may be alphanumeric (e.g. -rc1).
+        if !candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            continue;
+        }
+        return Some(candidate.to_string());
+    }
+    None
+}
+
+/// Compare two `MAJOR.MINOR.PATCH` versions (ignoring any pre-release suffix).
+///
+/// Returns `true` when `installed >= required`. Unparseable input returns
+/// `false` — callers treat that as "not compatible".
+pub fn version_at_least(installed: &str, required: &str) -> bool {
+    fn parts(v: &str) -> Option<(u64, u64, u64)> {
+        let core = v.split('-').next().unwrap_or(v);
+        let mut it = core.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next()?.parse().ok()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some((major, minor, patch))
+    }
+    match (parts(installed), parts(required)) {
+        (Some(a), Some(b)) => a >= b,
+        _ => false,
+    }
+}
+
 /// Run environment diagnostics and return structured results.
 ///
 /// This never mutates state and never prints secret material.
@@ -135,6 +197,20 @@ pub fn diagnose() -> Vec<Diagnostic> {
                 name: "stellar_cli_version".into(),
                 ok: true,
                 detail: cli.version.lines().next().unwrap_or("unknown").to_string(),
+            });
+            let version_ok = extract_version(&cli.version)
+                .map(|v| version_at_least(&v, MINIMUM_CLI_VERSION))
+                .unwrap_or(false);
+            results.push(Diagnostic {
+                name: "stellar_cli_version_ok".into(),
+                ok: version_ok,
+                detail: match extract_version(&cli.version) {
+                    Some(v) => format!("requires >= {MINIMUM_CLI_VERSION}; found {v}"),
+                    None => format!(
+                        "could not parse version from {}",
+                        cli.version.lines().next().unwrap_or("unknown")
+                    ),
+                },
             });
 
             match cli.list_networks() {
@@ -245,5 +321,70 @@ mod tests {
         for d in &results {
             assert!(!d.detail.is_empty());
         }
+    }
+
+    #[test]
+    fn extract_version_pulls_the_dotted_triplet() {
+        assert_eq!(
+            extract_version("stellar 28.1.0 (c0f4d0da891bbf214c08b8c5035ae6db80e9a3bd)"),
+            Some("28.1.0".to_string())
+        );
+        assert_eq!(
+            extract_version("stellar 28.1.0"),
+            Some("28.1.0".to_string())
+        );
+        assert_eq!(
+            extract_version("stellar 28.1.0-rc1 (abcdef)"),
+            Some("28.1.0-rc1".to_string())
+        );
+        // Leading junk before the version must not defeat extraction.
+        assert_eq!(
+            extract_version("stellar v28.1.0"),
+            Some("28.1.0".to_string())
+        );
+        assert_eq!(extract_version(""), None);
+        assert_eq!(extract_version("stellar"), None);
+        // A two-part or four-part version must not be mistaken for one.
+        assert_eq!(extract_version("stellar 28.1"), None);
+        assert_eq!(extract_version("stellar 28.1.0.1"), None);
+    }
+
+    #[test]
+    fn version_at_least_compares_major_minor_patch() {
+        assert!(version_at_least("28.1.0", "28.1.0"));
+        assert!(version_at_least("28.1.1", "28.1.0"));
+        assert!(version_at_least("28.2.0", "28.1.0"));
+        assert!(version_at_least("29.0.0", "28.1.0"));
+        assert!(version_at_least("28.1.0-rc1", "28.1.0"));
+        assert!(!version_at_least("28.0.9", "28.1.0"));
+        assert!(!version_at_least("27.9.9", "28.1.0"));
+        assert!(!version_at_least("28.0.0", "28.1.0"));
+    }
+
+    #[test]
+    fn version_at_least_rejects_unparseable_input() {
+        assert!(!version_at_least("", "28.1.0"));
+        assert!(!version_at_least("28.1.0", ""));
+        assert!(!version_at_least("abc", "28.1.0"));
+        assert!(!version_at_least("28.1.0", "not-a-version"));
+        assert!(!version_at_least("28.1", "28.1.0"));
+    }
+
+    #[test]
+    fn diagnose_emits_version_compatibility_check() {
+        let results = diagnose();
+        if !results.iter().any(|d| d.name == "stellar_cli") {
+            // No CLI on this host; the check is emitted only when the CLI exists.
+            return;
+        }
+        let check = results
+            .iter()
+            .find(|d| d.name == "stellar_cli_version_ok")
+            .expect("diagnose must emit stellar_cli_version_ok when the CLI is present");
+        assert!(
+            check.detail.contains(MINIMUM_CLI_VERSION),
+            "detail must state the required floor, got {:?}",
+            check.detail
+        );
     }
 }

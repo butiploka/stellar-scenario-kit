@@ -9,7 +9,7 @@ use stellar_scenario::assert::{
 };
 use stellar_scenario::cli::{Cli, Command, OutputFormat};
 use stellar_scenario::inspect::{InspectReport, InspectReportStatus, InspectResult};
-use stellar_scenario::plan::{ExecutionPlan, SideEffect};
+use stellar_scenario::plan::{ExecutionPlan, ExecutionStatus, SideEffect};
 use stellar_scenario::reporter::ValidationReport;
 use stellar_scenario::runner::find_stellar_cli;
 use stellar_scenario::scaffold::{ScaffoldResult, ScaffoldStatus};
@@ -43,7 +43,7 @@ fn run_validate(file: &Path, output: OutputFormat) -> ExitCode {
     };
 
     match output {
-        OutputFormat::Json => println!("{}", report.to_json()),
+        OutputFormat::Json | OutputFormat::Jsonl => println!("{}", report.to_json()),
         OutputFormat::Text => eprintln!("{}", report.to_text()),
     }
 
@@ -56,7 +56,7 @@ fn run_plan(file: &Path, output: OutputFormat) -> ExitCode {
         Err(e) => {
             let report = ValidationReport::invalid(file, &e);
             match output {
-                OutputFormat::Json => println!("{}", report.to_json()),
+                OutputFormat::Json | OutputFormat::Jsonl => println!("{}", report.to_json()),
                 OutputFormat::Text => eprintln!("{}", report.to_text()),
             }
             return ExitCode::from(e.exit_code() as u8);
@@ -70,7 +70,7 @@ fn run_plan(file: &Path, output: OutputFormat) -> ExitCode {
     let plan = ExecutionPlan::build(&scenario, &executable);
 
     match output {
-        OutputFormat::Json => println!("{}", plan.to_json()),
+        OutputFormat::Json | OutputFormat::Jsonl => println!("{}", plan.to_json()),
         OutputFormat::Text => eprintln!("{}", plan.to_text()),
     }
 
@@ -84,6 +84,10 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
             let report = ValidationReport::invalid(file, &e);
             match output {
                 OutputFormat::Json => println!("{}", report.to_json()),
+                // JSONL keeps stdout for the step event stream; a scenario
+                // that never parsed produced no events, so the error report
+                // goes to the stderr aggregate channel instead.
+                OutputFormat::Jsonl => eprintln!("{}", report.to_compact_json()),
                 OutputFormat::Text => eprintln!("{}", report.to_text()),
             }
             return ExitCode::from(e.exit_code() as u8);
@@ -96,6 +100,8 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
             let msg = format!("stellar CLI unavailable: {e}");
             match output {
                 OutputFormat::Json => println!("{{\"error\":\"{msg}\"}}"),
+                // No steps ran, so nothing belongs on the stdout event stream.
+                OutputFormat::Jsonl => eprintln!("{{\"error\":\"{msg}\"}}"),
                 OutputFormat::Text => eprintln!("error: {msg}"),
             }
             return ExitCode::from(2);
@@ -114,6 +120,8 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
                 step_index: idx,
                 action: step.action.clone(),
                 reason: SkipReason::WouldMutate,
+                execution_status: ExecutionStatus::WouldMutate,
+                block_reason: Some("would mutate ledger state; blocked in plan mode".to_string()),
             });
             continue;
         }
@@ -122,6 +130,8 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
                 step_index: idx,
                 action: step.action.clone(),
                 reason: SkipReason::NotExecutable,
+                execution_status: ExecutionStatus::Executable,
+                block_reason: None,
             });
             continue;
         }
@@ -137,6 +147,12 @@ fn run_assert(file: &Path, output: OutputFormat) -> ExitCode {
 
     match output {
         OutputFormat::Json => println!("{}", report.to_json()),
+        // stdout gets the per-step JSONL event stream; the aggregate report
+        // (with step_counts) is emitted on stderr.
+        OutputFormat::Jsonl => {
+            print!("{}", report.to_jsonl_events());
+            eprintln!("{}", report.to_compact_json());
+        }
         OutputFormat::Text => eprintln!("{}", report.to_text()),
     }
 
@@ -153,7 +169,7 @@ fn run_inspect(file: &Path, output: OutputFormat) -> ExitCode {
         Err(e) => {
             let report = ValidationReport::invalid(file, &e);
             match output {
-                OutputFormat::Json => println!("{}", report.to_json()),
+                OutputFormat::Json | OutputFormat::Jsonl => println!("{}", report.to_json()),
                 OutputFormat::Text => eprintln!("{}", report.to_text()),
             }
             return ExitCode::from(e.exit_code() as u8);
@@ -165,7 +181,7 @@ fn run_inspect(file: &Path, output: OutputFormat) -> ExitCode {
         Err(e) => {
             let msg = format!("stellar CLI unavailable: {e}");
             match output {
-                OutputFormat::Json => println!("{{\"error\":\"{msg}\"}}"),
+                OutputFormat::Json | OutputFormat::Jsonl => println!("{{\"error\":\"{msg}\"}}"),
                 OutputFormat::Text => eprintln!("error: {msg}"),
             }
             return ExitCode::from(2);
@@ -204,7 +220,7 @@ fn run_inspect(file: &Path, output: OutputFormat) -> ExitCode {
     let report = InspectReport::new(&scenario, results, skipped);
 
     match output {
-        OutputFormat::Json => println!("{}", report.to_json()),
+        OutputFormat::Json | OutputFormat::Jsonl => println!("{}", report.to_json()),
         OutputFormat::Text => eprintln!("{}", report.to_text()),
     }
 
@@ -279,7 +295,7 @@ fn run_scaffold(
         Err(e) => {
             let report = ValidationReport::invalid(file, &e);
             match output {
-                OutputFormat::Json => println!("{}", report.to_json()),
+                OutputFormat::Json | OutputFormat::Jsonl => println!("{}", report.to_json()),
                 OutputFormat::Text => eprintln!("{}", report.to_text()),
             }
             return ExitCode::from(e.exit_code() as u8);
@@ -305,7 +321,7 @@ fn run_scaffold(
                 "no_contract_in_scenario"
             };
             match output {
-                OutputFormat::Json => println!(
+                OutputFormat::Json | OutputFormat::Jsonl => println!(
                     "{}",
                     serde_json::json!({
                         "scenario": scenario.name,
@@ -342,7 +358,7 @@ fn run_scaffold(
                 remediation: Some(diag.remediation.clone()),
             };
             match output {
-                OutputFormat::Json => println!(
+                OutputFormat::Json | OutputFormat::Jsonl => println!(
                     "{}",
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
                 ),
@@ -355,7 +371,7 @@ fn run_scaffold(
     let result = ScaffoldResult::execute(&scenario, file, Some(&selected), &function, &executable);
 
     match output {
-        OutputFormat::Json => {
+        OutputFormat::Json | OutputFormat::Jsonl => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
@@ -389,7 +405,7 @@ fn run_doctor(output: OutputFormat) -> ExitCode {
     let all_ok = diagnostics.iter().all(|d| d.ok);
 
     match output {
-        OutputFormat::Json => {
+        OutputFormat::Json | OutputFormat::Jsonl => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&diagnostics).unwrap_or_default()
@@ -417,6 +433,7 @@ fn run_simulate(file: &Path, output: OutputFormat) -> ExitCode {
             let report = ValidationReport::invalid(file, &e);
             match output {
                 OutputFormat::Json => println!("{}", report.to_json()),
+                OutputFormat::Jsonl => eprintln!("{}", report.to_compact_json()),
                 OutputFormat::Text => eprintln!("{}", report.to_text()),
             }
             return ExitCode::from(e.exit_code() as u8);
@@ -429,6 +446,7 @@ fn run_simulate(file: &Path, output: OutputFormat) -> ExitCode {
             let msg = format!("stellar CLI unavailable: {e}");
             match output {
                 OutputFormat::Json => println!("{{\"error\":\"{msg}\"}}"),
+                OutputFormat::Jsonl => eprintln!("{{\"error\":\"{msg}\"}}"),
                 OutputFormat::Text => eprintln!("error: {msg}"),
             }
             return ExitCode::from(2);
@@ -456,6 +474,10 @@ fn run_simulate(file: &Path, output: OutputFormat) -> ExitCode {
     let report = SimulationReport::new(&scenario, results, skipped);
 
     match output {
+        OutputFormat::Jsonl => {
+            print!("{}", report.to_jsonl_events());
+            eprintln!("{}", report.to_compact_json());
+        }
         OutputFormat::Json => println!("{}", report.to_json()),
         OutputFormat::Text => eprintln!("{}", report.to_text()),
     }
